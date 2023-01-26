@@ -1,0 +1,9 @@
+torch
+transformers
+datasets
+notebook
+numpy
+scipy
+spacy
+neptune-client
+wandb

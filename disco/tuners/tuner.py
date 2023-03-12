@@ -289,7 +289,7 @@ class Tuner():
     def _report_and_reset_divergence_estimate(self, divergence_estimates_dict, arguments_name):
         """
         Reports all tracked divergences in the divergence_estimates_dict using
-        as key name a concatentation of the divergence type name and the arguments_name
+        as key name a concatenation of the divergence type name and the arguments_name
 
         divergence_estimates_dict: dictionary of strings to MovingAverage
             The dictionary tracking divergence estimates

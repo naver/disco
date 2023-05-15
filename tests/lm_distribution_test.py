@@ -3,7 +3,9 @@
 # Creative Commons Attribution-NonCommercial-ShareAlike 4.0 license
 
 import unittest
-import torch
+import random, torch
+import numpy as np
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
 
 from disco.distributions import LMDistribution
 from disco.distributions.lm_distribution import TextSample
@@ -11,6 +13,12 @@ from disco.distributions.lm_distribution import TextSample
 prefix = "It was a cold and stormy night"
 
 class LMDistributionTest(unittest.TestCase):
+
+    def setUp(self):
+        test_models = [("gpt2", AutoModelForCausalLM),
+                ("facebook/bart-base", AutoModelForSeq2SeqLM)]
+        self.test_distributions = {model: LMDistribution(model, auto=auto)
+                for (model, auto) in test_models}
 
     def test_instantiate_a_default_distribution(self):
         distribution = LMDistribution()
@@ -71,13 +79,14 @@ class LMDistributionTest(unittest.TestCase):
             self.assertLess(log_score, 0.0, "each log-score should be negative.")
 
     def test_score_sampled_sequences(self):
-        prompt = "It was a cold and stormy night"
-        distribution = LMDistribution()
-        samples, log_scores = distribution.sample(context=prefix)
-        samples_log_scores_again = distribution.log_score(samples, context=prefix)
-        self.assertLess((log_scores - samples_log_scores_again).abs().max(),
-                1e-3, "log-scores given at sampling time and the scoring of "
-                "the same samples should match")
+        for model, distribution in self.test_distributions.items():
+            prompt = "It was a cold and stormy night"
+            distribution = LMDistribution()
+            samples, log_scores = distribution.sample(context=prefix)
+            samples_log_scores_again = distribution.log_score(samples, context=prefix)
+            self.assertLess((log_scores - samples_log_scores_again).abs().max(),
+                    1e-3, "log-scores given at sampling time and the scoring of "
+                    "the same samples should match")
 
     def test_score_with_a_non_default_top_k_specified(self):
         distribution = LMDistribution(top_k=20)
@@ -114,36 +123,40 @@ class LMDistributionTest(unittest.TestCase):
         self.assertRaises(AssertionError, distribution.log_score, samples, context=prefix)
 
     def test_ignore_padding_at_score(self):
-        distribution = LMDistribution()
-        text = "The streets were empty and quiet."
-        
-        from disco.distributions.lm_distribution import TextSample
-        sample = TextSample(distribution.tokenizer(text, return_tensors="pt", add_special_tokens=True)["input_ids"][0], text)
-        pad_token_id = distribution.tokenizer.pad_token_id
-                
-        decoded_pad = distribution.tokenizer.decode(pad_token_id)
-        padded_sample = TextSample(
-                token_ids=torch.cat((sample.token_ids, torch.tensor([pad_token_id])), dim=0),
-                text=text + decoded_pad)
+        for model, distribution in self.test_distributions.items():
+            text = "The streets were empty and quiet."
 
-        double_padded_sample = TextSample(
-                token_ids=torch.cat((sample.token_ids, torch.tensor([pad_token_id, pad_token_id])), dim=0),
-                text=text + decoded_pad + decoded_pad)
+            from disco.distributions.lm_distribution import TextSample
+            sample = TextSample(distribution.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0], text)
+            eos_token_id = distribution.tokenizer.eos_token_id
+            pad_token_id = distribution.tokenizer.pad_token_id
 
-        log_scores = distribution.log_score([sample])
-        padded_log_scores = distribution.log_score([padded_sample])
-        double_padded_log_scores = distribution.log_score([double_padded_sample])
+            eos_token = distribution.tokenizer.eos_token
+            pad_token = distribution.tokenizer.pad_token
+            completed_sample = TextSample(
+                    token_ids=torch.cat((sample.token_ids, torch.tensor([eos_token_id])), dim=0),
+                    text=text + eos_token)
 
-        self.assertNotEqual(0, log_scores[0])
-        self.assertGreater(torch.abs(log_scores[0] - padded_log_scores[0]), 1e-1)
-        self.assertLess(torch.abs(padded_log_scores[0] - double_padded_log_scores[0]), 1e-2)
+            padded_sample = TextSample(
+                    token_ids=torch.cat((sample.token_ids, torch.tensor([eos_token_id, pad_token_id])), dim=0),
+                    text=text + pad_token + pad_token)
+
+            log_scores = distribution.log_score([sample])
+            completed_log_scores = distribution.log_score([completed_sample])
+            padded_log_scores = distribution.log_score([padded_sample])
+
+            self.assertNotEqual(0, log_scores[0])
+            self.assertGreater(torch.abs(log_scores[0] - completed_log_scores[0]), 1e-4, 
+                    f"The {model} scores must be different with and without and eos token.")
+            self.assertLess(torch.abs(completed_log_scores[0] - padded_log_scores[0]), 1e-2,
+                    f"The {model} scores must not be different with and without a pad token after an eos token.")
 
     def test_ignore_padding_at_sample(self):
         distribution = LMDistribution()
         seed = 0
         torch.manual_seed(seed)
-        import numpy as np; np.random.seed(seed)
-        import random; random.seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
         samples, log_scores = distribution.sample()
         padded_sequence_id = 8 # found manually
         padded_sequence = samples[padded_sequence_id]
@@ -154,37 +167,52 @@ class LMDistributionTest(unittest.TestCase):
         self.assertLess(torch.abs(padded_sequence_log_score - padded_sequence_relog_score), 1e-2)
 
     def test_empty_sequence_score(self):
-        distribution = LMDistribution()
-        pad_token_id = distribution.tokenizer.pad_token_id
-        empty_sequence_tok = [pad_token_id]*20
-        empty_sequence_str = distribution.tokenizer.decode(empty_sequence_tok)
-        empty_sequence = TextSample(token_ids=torch.tensor(empty_sequence_tok),
-                text=empty_sequence_str)
-        log_score = distribution.log_score([empty_sequence])
-        manual_log_score = torch.log_softmax(distribution.network.forward(empty_sequence.token_ids[:1]).logits,
-                -1)[0, pad_token_id]
-        self.assertLess(torch.abs(log_score - manual_log_score), 1e-2)
+        for model, distribution in self.test_distributions.items():
+            pad_token_id = distribution.tokenizer.pad_token_id
+            empty_sequence_tok = [pad_token_id]*20
+            empty_sequence_str = distribution.tokenizer.decode(empty_sequence_tok)
+            empty_sequence = TextSample(token_ids=torch.tensor(empty_sequence_tok),
+                    text=empty_sequence_str)
+            log_score = distribution.log_score([empty_sequence])
+            if distribution.network.config.is_encoder_decoder:
+                ctxt = distribution.tokenizer('', return_tensors="pt", add_special_tokens=True)
+                manual_log_score = torch.log_softmax(
+                        distribution.network.forward(
+                            decoder_input_ids=empty_sequence.token_ids[:1].unsqueeze(0), **ctxt).logits,
+                        -1)[0, 0, pad_token_id]
+            else:
+                manual_log_score = torch.log_softmax(
+                            distribution.network.forward(empty_sequence.token_ids[:1].unsqueeze(0)).logits, 
+                        -1)[0, 0, pad_token_id]
+            self.assertLess(torch.abs(log_score - manual_log_score), 1e-2, 
+                    f"The {model} score of all pad tokens should correspond to a single one.")
 
     def test_scoring_consistent_with_loss(self):
-        distribution = LMDistribution()
-        text = "The streets were empty and quiet."
+        for model, distribution in self.test_distributions.items():
+            text = "The streets were empty and quiet."
 
-        from disco.distributions.lm_distribution import TextSample
-        sample = TextSample(distribution.tokenizer(text, return_tensors="pt", add_special_tokens=True)["input_ids"][0], text)
-        log_score = distribution.log_score([sample])
-        loss = distribution.network(sample.token_ids, labels=sample.token_ids).loss
-        self.assertLess(torch.abs(-log_score / len(sample.token_ids) -  loss), 1e-2)
+            from disco.distributions.lm_distribution import TextSample
+            sample = TextSample(distribution.tokenizer(text, return_tensors="pt", add_special_tokens=True)["input_ids"][0], text)
+            log_score = distribution.log_score([sample])
+            if distribution.network.config.is_encoder_decoder:
+                ctxt = distribution.tokenizer('', return_tensors="pt", add_special_tokens=True)
+                loss = distribution.network(input_ids=ctxt.input_ids,
+                        labels=sample.token_ids.unsqueeze(0)).loss
+            else:
+                loss = distribution.network(sample.token_ids, labels=sample.token_ids).loss
+            self.assertLess(torch.abs(-log_score / len(sample.token_ids) -  loss), 1e-2, 
+                    f'The {model} score is not consistent with the loss reported by the forward function.')
 
     def test_sample_empty_sequence(self):
-        distribution = LMDistribution()
+        distribution = LMDistribution("gpt2")
         pad_token_id = distribution.tokenizer.pad_token_id
         epsilon = 0.05
         # increase the likelihood of sampling pad_token_id
         distribution.network.lm_head.weight.data[pad_token_id, :] += epsilon
         seed = 1
         torch.manual_seed(seed)
-        import numpy as np; np.random.seed(seed)
-        import random; random.seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
         samples, log_scores = distribution.sample()
         self.assertTrue(any((s.token_ids == pad_token_id).all() for s in samples))
         new_log_scores = distribution.log_score(samples)

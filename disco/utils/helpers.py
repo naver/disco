@@ -16,6 +16,19 @@ def batchify(func, batch, samples=list(), **args):
     return torch.cat(all)
 
 def get_token_first_indices(x, token):
+    """Find the first occurrence of a token in a 2D token array.
+
+    Parameters
+    ----------
+    x: 2D int array
+       list of token sequences
+    token: int
+        token to search
+
+    Returns
+    ------
+    1D array containing the position of the first occurrence of the token or -1 if not found
+    """
     if 0 == x.shape[-1]:
         return torch.tensor(-1).repeat(x.shape[0])
     else:

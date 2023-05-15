@@ -20,12 +20,12 @@ dev0, dev1 = "cpu", "cpu" # "0", "1" to use GPUs
 n_gradient_steps = 10 # 1000 or more for actual tuning
 divergence_evaluation_interval = 2**2 # 2**4 for actual tuning?
 
-base = LMDistribution(network=gpt, device=dev0)
+base = LMDistribution(model=gpt, device=dev0)
 has_word = lambda s, c: bool(re.search(f"\\b{word}\\b", s.text))
 word_scorer = BooleanScorer(has_word)
 target = base * word_scorer
 
-model = LMDistribution(network=gpt, freeze=False, device=dev1)
+model = LMDistribution(model=gpt, freeze=False, device=dev1)
 
 tuner = DPGTuner(model, target,
         context = incipit,

@@ -20,19 +20,20 @@ class LMDistribution(BaseDistribution):
     """
 
     def __init__(self,
-            network="gpt2", tokenizer="gpt2", nature="causal", freeze=True,
+            model="gpt2", tokenizer=None, auto=AutoModelForCausalLM, freeze=True,
             length=40, device="cpu",
             **config
         ):
         """
         Parameters
         ----------
-        network: string
+        model: string
             Transformers' name of a causal or seq2seq language model 
         tokenizer: string
             Transformers' name for the related tokenizer
-        nature: string
-            "causal" or "seq2seq" to use the correct config class from Transformers
+        auto: class
+            auto class from Transformers, default is AutoModelForCausalLM
+            but AutoModelForSeq2SeqLM is also valid
         freeze: boolean
             flag to eventually (not) freeze the network's parameters
         length: int
@@ -43,16 +44,10 @@ class LMDistribution(BaseDistribution):
             parameters and values passed to transformers' ```generate(…)```
         """
 
-        assert nature in ["causal", "seq2seq"], "only causal and seq2seq model are handled."
-        self.nature = nature
-        klass = AutoModelForCausalLM if "causal" == nature else AutoModelForSeq2SeqLM
+        self.tokenizer= AutoTokenizer.from_pretrained(tokenizer if tokenizer else model)
+        assert auto in [AutoModelForCausalLM, AutoModelForSeq2SeqLM], "only AutoModel, AutoModelForCausalLM and AutoModelForSeq2SeqLM are valid options."
+        self._load_network(auto, model)
     
-        self.tokenizer= AutoTokenizer.from_pretrained(tokenizer)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.network = klass.from_pretrained(
-                network,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
         self.device = device
         self.network.to(self.device)
         self.network.eval() # to make sure scoring is consistent
@@ -74,6 +69,12 @@ class LMDistribution(BaseDistribution):
         self.scorable = True if all(\
                 [default_params[k] == self.params[k] for k in default_params.keys()]\
             ) else False
+
+    def _load_network(self, auto, model):
+        self.network = auto.from_pretrained(model)
+        if not self.network.config.is_encoder_decoder:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.network.config.pad_token_id = self.tokenizer.eos_token_id
 
     def to(self, device):
         self.device = device
@@ -116,7 +117,8 @@ class LMDistribution(BaseDistribution):
 
         device = self.device
 
-        context = self.tokenizer.convert_ids_to_tokens(self.tokenizer.bos_token_id) if "" == context else context
+        if not self.network.config.is_encoder_decoder:
+            context = self.tokenizer.bos_token if "" == context else context
         tokenized_context = self.tokenizer([context] * len(samples), return_tensors="pt", add_special_tokens=True)
         tokenized_context["input_ids"] = tokenized_context["input_ids"].to(device)
         tokenized_context["attention_mask"] = tokenized_context["attention_mask"].to(device)
@@ -133,10 +135,22 @@ class LMDistribution(BaseDistribution):
                 0, 1
             )
         for i, ix in enumerate(first_eos_indices):
-            tokenized_samples["attention_mask"][i][ix] = 1
+            if None != self.network.config.forced_bos_token_id and\
+                self.network.config.forced_bos_token_id == tokenized_samples["input_ids"][i][0]:
+                    tokenized_samples["attention_mask"][i][0] = 0
+            else:
+                tokenized_samples["attention_mask"][i][0] = 1  # at least score one token
+            if ix != -1:  # if there is an eos token
+                tokenized_samples["attention_mask"][i][ix] = 1  # score first eos token
+                tokenized_samples["attention_mask"][i][ix + 1:] = 0  # ignore everything after it
         tokenized_samples["attention_mask"] = tokenized_samples["attention_mask"].to(device)
 
-        if "causal" == self.nature:
+        if self.network.config.is_encoder_decoder:
+            shift = None
+            last = None
+            inputs = tokenized_context
+            labels = tokenized_samples["input_ids"]
+        else:
             shift = tokenized_context["input_ids"].shape[-1] - 1
             last = -1
             inputs = {
@@ -144,11 +158,6 @@ class LMDistribution(BaseDistribution):
                 "attention_mask": torch.cat((tokenized_context["attention_mask"], tokenized_samples["attention_mask"]), 1)
             }
             labels = inputs["input_ids"]
-        else:
-            shift = None
-            last = None
-            inputs = tokenized_context
-            labels = tokenized_samples["input_ids"]
 
         if grad:
             outputs = self.network(**inputs, labels=labels)
@@ -182,16 +191,18 @@ class LMDistribution(BaseDistribution):
         tuple of (list of Sample(tokens, text), tensor of logprobs)
         """
     
-        context = self.tokenizer.convert_ids_to_tokens(self.tokenizer.bos_token_id) if "" == context else context
+        if not self.network.config.is_encoder_decoder and not context:
+            context = self.tokenizer.bos_token
         input_ids = self.tokenizer([context] * sampling_size, return_tensors="pt", add_special_tokens=True).input_ids.to(self.device)
         n_context_tokens = input_ids.shape[-1]
 
-        if "causal" == self.nature:
-            shift = n_context_tokens
-            last = None
-        else:
+        if self.network.config.is_encoder_decoder:
             shift = 1
             last = None
+        else:
+            shift = n_context_tokens
+            last = None
+
         outputs = self.network.generate(input_ids,
             output_scores=True, return_dict_in_generate=True,
             max_new_tokens=self.length,
@@ -218,7 +229,10 @@ class LMDistribution(BaseDistribution):
             )
         non_pad_log_scores = torch.where(-1 != non_pad_tokens, token_seq_logprobs, torch.tensor(0.).to(self.device))
         for i, ix in enumerate(first_eos_indices):
-            non_pad_log_scores[i][ix] = token_seq_logprobs[i][ix]
+            non_pad_log_scores[i][0] = token_seq_logprobs[i][0]  # at least score one token
+            if ix != -1: # if there an eos token
+                non_pad_log_scores[i][ix] = token_seq_logprobs[i][ix]  # keep the first eos scores
+                non_pad_log_scores[i][ix + 1:] = 0. # ignore everything after eos
         
         seq_logprobs = non_pad_log_scores.sum(dim=1) if sum else non_pad_log_scores
 

@@ -236,6 +236,12 @@ class LMDistributionTest(unittest.TestCase):
         distribution.freeze()
         self.assertTrue(all([not p.requires_grad for p in distribution.network.parameters()]))
 
+    def test_clone(self):
+        distribution = LMDistribution()
+        distribution2 = distribution.clone()
+        self.assertEqual(distribution.network.config, distribution2.network.config)
+        self.assertNotEqual(distribution.network, distribution2.network)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -4,6 +4,7 @@
 
 import torch
 from tqdm.autonotebook import trange
+import copy
 
 from disco.scorers.positive_scorer import Product
 from disco.scorers.exponential_scorer import ExponentialScorer
@@ -21,6 +22,9 @@ class BaseDistribution(Distribution):
     Base distribution class, which can be used
     to build an EBM.
     """
+
+    def clone(self):
+        return copy.deepcopy(self)
 
     def constrain(self,
             features, moments=None,

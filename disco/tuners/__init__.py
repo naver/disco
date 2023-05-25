@@ -5,3 +5,5 @@
 from .tuner import Tuner
 from .dpg_tuner import DPGTuner
 from .cdpg_tuner import CDPGTuner
+from .fdpg_tuner import FDPGTuner
+from .fcdpg_tuner import FCDPGTuner

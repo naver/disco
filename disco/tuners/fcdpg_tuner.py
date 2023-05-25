@@ -7,26 +7,26 @@ from disco.distributions.single_context_distribution import SingleContextDistrib
 from disco.tuners.losses import *
 
 
-class CDPGTuner(Tuner):
-    """Contextual DPG tuning class,
-    relying on a ContextDistribution and KLLoss().
+class FCDPGTuner(Tuner):
+    """Contextual f-DPG tuning class. The algorithm was introduced in
 
-    The algorithm has been introduced in
-    "Controlling Conditional Language Models without Catastrophic Forgetting"
-    Tomasz Korbak, Hady Elsahar, Germán Kruszewski and Marc Dymetman.
-    https://proceedings.mlr.press/v162/korbak22a/korbak22a.pdf
+    "Aligning Language Models with Preferences through f-divergence Minimization."
+    Dongyoung Go, Tomasz Korbak, Germán Kruszewski, Jos Rozen, Nahyeon Ryu, Marc Dymetman.
+    https://arxiv.org/abs/2302.08215
     """
 
     def __init__(self, *args, context_distribution=SingleContextDistribution(),
-            loss=KLLoss(), **kwargs):
+            loss=JSLoss(), **kwargs):
         """
         Parameters
         ----------
         context_distribution: distribution
             a distribution to contextualize the sampling from the proposal
+        loss: functor object
+            used to compute of the loss at each step
         """
 
-        super(CDPGTuner, self).__init__(
+        super(FCDPGTuner, self).__init__(
                 *args,
                 context_distribution=context_distribution,
                 loss=loss,

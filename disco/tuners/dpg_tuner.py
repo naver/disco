@@ -9,6 +9,11 @@ class DPGTuner(CDPGTuner):
     """
     DPG tuning class,
     a specific case of CDPG with a single, fixed, context.
+
+    The algorithm has been introduced in
+    "Distributional Reinforcement Learning for Energy-Based Sequential Models"
+    Tetiana Parshakova, Jean-Marc Andreoli, Marc Dymetman
+    https://arxiv.org/abs/1912.08517
     """
 
     def __init__(self, *args, context="", **kwargs):

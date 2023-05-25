@@ -64,7 +64,7 @@ class Tuner():
         "proposal_update_metric": "kl" # the proposal will be updated if the model is better according to this metric
     }
 
-    def __init__(self, model, target, proposal=None, context_distribution=SingleContextDistribution(), loss=KLLoss(), features=[], 
+    def __init__(self, model, target, proposal=None, context_distribution=SingleContextDistribution(), loss=JSLoss(), features=[], 
             track_metrics=["kl", "tv", "js"], track_divergence_from_base=False, **params):
         """
         Parameters

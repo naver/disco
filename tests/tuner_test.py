@@ -95,6 +95,39 @@ class TunerTest(unittest.TestCase):
             tuner.tune()
             self.assertTrue('loss' in obs.observations)
 
+    def test_moments(self):
+        base = LMDistribution()
+        scorer = BooleanScorer(lambda s, c: "amazing" in s.text)
+        target = base.constrain([scorer], [1])
+        model = LMDistribution(freeze=False)
+        context_distribution = SingleContextDistribution("The movie was absolutely")
+        tuner = FCDPGTuner(model, target,
+                context_distribution=context_distribution,
+                n_gradient_steps=1,
+                context_sampling_size=1,
+                n_samples_per_step=128,
+                divergence_evaluation_interval=1,
+                scoring_size=32,
+                features=[('amazing', scorer)])
+        with MockObserver(tuner) as obs:
+            tuner.tune()
+            self.assertTrue('amazing_proposal' in obs.observations)
+            self.assertTrue('amazing_target' in obs.observations)
+            self.assertAlmostEqual(obs.observations['amazing_proposal'].item(), 0.1, 1)
+            self.assertAlmostEqual(obs.observations['amazing_target'].item(), 0.1, 1)
+            self.assertAlmostEqual(obs.observations['amazing_proposal'].item(), 
+                    obs.observations['amazing_target'].item(), 4)
+        tuner = FCDPGTuner(model, target,
+                context_distribution=context_distribution,
+                n_gradient_steps=1,
+                context_sampling_size=1,
+                n_samples_per_step=1,
+                scoring_size=1)
+        with MockObserver(tuner) as obs:
+            tuner.tune()
+            self.assertTrue('amazing_proposal' not in obs.observations)
+            self.assertTrue('amazing_target' not in obs.observations)
+
 class MockObserver(BaseTunerObserver):
     def __init__(self, tuner):
         super(MockObserver, self).__init__(tuner)

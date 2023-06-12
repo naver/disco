@@ -103,31 +103,6 @@ class Tuner():
 
         self.context_distribution = context_distribution
 
-        if self.params["proposal_update_metric"] not in track_metrics:
-            track_metrics.append(self.params["proposal_update_metric"])
-
-        self.z = defaultdict(MovingAverage)
-        self.divergence_estimates_target_proposal = dict()
-        self.divergence_estimates_target_model = dict()
-        for metric in track_metrics:
-            assert metric in divergence_pointwise_estimates_funcs, \
-                    f"Unknown metric {metric}. " \
-                    f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
-            self.divergence_estimates_target_proposal[metric] = defaultdict(MovingAverage)
-            self.divergence_estimates_target_model[metric] = defaultdict(MovingAverage)
-
-        self.track_divergence_from_base = track_divergence_from_base
-        if self.track_divergence_from_base:
-            self.divergence_estimates_proposal_base = dict()
-            self.divergence_estimates_model_base = dict()
-            for metric in track_metrics:
-                assert metric in divergence_pointwise_estimates_funcs, \
-                        f"Unknown metric {metric}. " \
-                        f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
-                self.divergence_estimates_proposal_base[metric] = defaultdict(MovingAverage)
-                self.divergence_estimates_model_base[metric] = defaultdict(MovingAverage)
-
-
         self._loss = loss
 
         self.features = list(features)
@@ -154,24 +129,67 @@ class Tuner():
         self.proposal_updated = Observable()
         self.eval_samples_updated = Observable()
 
+        # setup metrics to track
         forward(self._loss.metric_updated, self.metric_updated)
 
+        if self.params["proposal_update_metric"] not in track_metrics:
+            track_metrics.append(self.params["proposal_update_metric"])
+
+        self.z = defaultdict(MovingAverage)
+        self.divergence_estimates_target_proposal = dict()
+        self.divergence_estimates_target_model = dict()
+        for metric in track_metrics:
+            assert metric in divergence_pointwise_estimates_funcs, \
+                    f"Unknown metric {metric}. " \
+                    f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
+            self.divergence_estimates_target_proposal[metric] = defaultdict(MovingAverage)
+            self.divergence_estimates_target_model[metric] = defaultdict(MovingAverage)
+
+        self.track_divergence_from_base = track_divergence_from_base
+        if self.track_divergence_from_base:
+            self.divergence_estimates_proposal_base = dict()
+            self.divergence_estimates_model_base = dict()
+            for metric in track_metrics:
+                assert metric in divergence_pointwise_estimates_funcs, \
+                        f"Unknown metric {metric}. " \
+                        f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
+                self.divergence_estimates_proposal_base[metric] = defaultdict(MovingAverage)
+                self.divergence_estimates_model_base[metric] = defaultdict(MovingAverage)
+
+        self.features_moments_proposal = dict()
+        self.features_moments_target = dict()
+        for (label, feature) in self.features:
+            self.features_moments_proposal[label] = defaultdict(MovingAverage)
+            self.features_moments_target[label] = defaultdict(MovingAverage)
         if self.features:
-            self.eval_samples_updated.enroll(self.report_feature_moments)
+            self.eval_samples_updated.enroll(self._update_features_moments)
 
-    def report_feature_moments(self, context, samples, proposal_log_scores, model_log_scores, target_log_scores):
+    def _update_features_moments(self, context, samples, proposal_log_scores, model_log_scores, target_log_scores):
+        """
+        Improves the importance sampling estimates of the feature moments
+        specified on construction of the Tuner
 
+        Parameters
+        ----------
+        context: text
+            context for the samples
+        samples: list of items
+            samples from the proposal network
+        proposal_log_scores: array of floats
+            log-probabilities for the samples according to the proposal
+        model_log_scores: array of floats
+            log-probabilities for the samples according to the model
+        target_log_scores: array of floats
+            log-probabilities for the samples according to the target
+        """
         device = get_device(proposal_log_scores)
         model_log_scores = model_log_scores.to(device)
         logweights = model_log_scores - proposal_log_scores
         importance_ratios = torch.exp(logweights)
-        moments = {}
         for (label, feature) in self.features:
             proposal_moment_pointwise_estimates = feature.log_score(samples, context).exp().to(device)
-            moments[f"proposal_{label}"] = torch.mean(proposal_moment_pointwise_estimates)
-            moments[f"model_{label}"] = torch.mean((importance_ratios * proposal_moment_pointwise_estimates))
-        for k, v in moments.items():
-            self.metric_updated.dispatch(k, v)
+            self.features_moments_proposal[label][context] += proposal_moment_pointwise_estimates
+            self.features_moments_target[label][context] += importance_ratios * proposal_moment_pointwise_estimates
 
     def _update_moving_z(self, proposal_log_scores, target_log_scores, context):
         """
@@ -286,20 +304,20 @@ class Tuner():
                 divergence_pointwise_estimates_funcs[divergence_type](
                     model_log_scores, base_log_scores, torch.as_tensor(1), proposal_log_scores)
 
-    def _report_and_reset_divergence_estimate(self, divergence_estimates_dict, arguments_name):
+    def _report_and_reset_importance_sampling_estimate(self, estimates_dict, distributions_name):
         """
-        Reports all tracked divergences in the divergence_estimates_dict using
-        as key name a concatentation of the divergence type name and the arguments_name
+        Reports all tracked metrics in the estimates_dict using
+        as key name a concatentation of the metric name and the distributions_name
 
-        divergence_estimates_dict: dictionary of strings to MovingAverage
-            The dictionary tracking divergence estimates
-        argument_name: string
-            A name that identifies the pair of distributions which divergence we are tracking
+        estimates_dict: dictionary (string, dictionary(string, MovingAverage))
+            The dictionary tracking metric estimates for each context
+        distributions_name: string
+            A name that identifies the distributions of which we are tracking the metric
         """
-        for divergence_type, moving_averages in divergence_estimates_dict.items():
-            self.metric_updated.dispatch(f"{divergence_type}_{arguments_name}",
+        for metric_name, moving_averages in estimates_dict.items():
+            self.metric_updated.dispatch(f"{metric_name}_{distributions_name}",
                     average(moving_averages))
-            divergence_estimates_dict[divergence_type] = defaultdict(MovingAverage)
+            estimates_dict[metric_name] = defaultdict(MovingAverage)
 
     def _update_proposal_if_better(self):
         """
@@ -413,8 +431,10 @@ class Tuner():
                 if  0 == (s + 1) % self.params["divergence_evaluation_interval"]:
                     if "offline" == self.learning:
                         self._update_proposal_if_better()
-                    self._report_and_reset_divergence_estimate(self.divergence_estimates_target_model, 'target_model')
-                    self._report_and_reset_divergence_estimate(self.divergence_estimates_target_proposal, 'target_proposal')
+                    self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_target_model, 'target_model')
+                    self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_target_proposal, 'target_proposal')
                     if self.track_divergence_from_base:
-                        self._report_and_reset_divergence_estimate(self.divergence_estimates_model_base, 'model_base')
-                        self._report_and_reset_divergence_estimate(self.divergence_estimates_proposal_base, 'proposal_base')
+                        self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_model_base, 'model_base')
+                        self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_proposal_base, 'proposal_base')
+                    self._report_and_reset_importance_sampling_estimate(self.features_moments_proposal, 'proposal')
+                    self._report_and_reset_importance_sampling_estimate(self.features_moments_target, 'target')

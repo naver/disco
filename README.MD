@@ -1,18 +1,24 @@
 # 🕺🏽 disco: A Toolkit for Distributional Control of Generative Models
 
-The 🕺🏽 **disco** toolkit allows to control the properties of the generations by language models and other generative systems to match human preferences while avoiding catastrophic forgetting.
+The 🕺🏽 **disco** toolkit allows to control language models and other generative systems to match human preferences while avoiding catastrophic forgetting.
 
-To achieve this in **disco**, we first represent in what ways we want to update original model as a target distribution and then, generate samples from this new distribution through a combination of learning or monte-carlo methods, as follows.
+To achieve this, **disco** decouples the problem of expressing _what_ properties the model should have from _how_ to actually get the desired model as separate steps.
 
-**Step 1: We express how the target distribution *should* be**
+**Step 1: ⚓ We express how the target distribution *should* be** 
 
-To have a handle on the generative model, we define some feature over the generated samples. It can be anything we can compute. For example, on a language model it can be as simple as whether the generated text contains a certain word or as complex as the compilability of some generated piece of code. Importantly, there is no need for the feature to be differentiable.
-Then, we can express our preferences on the target distribution by defining the target *moments* of this feature. For example, we might want to ask that a certain word appears 50% of the time when sampling from the model; or that 100% of the generated code is compilable. The resulting target distribution is expressed as an energy-based model or EBM, which is an unnormalized probability distribution that respects the desired moments while avoiding catastrophic forgetting, as a result of having minimal KL divergence to the original model.
-This representation of the target distribution can *score* samples, but cannot directly be used to *generate* them.
+First, we define some feature over the generated samples that matters to us. It can be anything we can compute. For example, on a language model it can be as simple as whether the generated text contains a certain word or as complex as the compilability of some generated piece of code. Importantly, there is no need for the feature to be differentiable.
 
-**Step 2: We generate samples from the target distribution**
+Then, we can express our preferences on the target distribution by deciding how prevalent the feature should be. For example, we might want to ask that a certain word appears 50% of the time when sampling from the model; or that 100% of the generated code is compilable. The resulting target distribution is expressed as an energy-based model or EBM, which is an unnormalized probability distribution that respects the desired moments while avoiding catastrophic forgetting, as a result of having minimal KL divergence to the original model.
 
-To generate samples from the target distribution, if not perfectly, we can tune a model to approximate it. The resulting model can generate samples directly from a close approximation of the target distribution. Furthermore, it can be used jointly with Quasi-Rejection Sampling (QRS), a Monte Carlo sampling technique that allows the generation of samples that are even more representative of the target distribution.
+The resulting representation of the target distribution can *score* samples, but cannot directly be used to *generate* them.
+
+**Step 2: 🎯 Approximate the target distribution** 
+
+To generate samples from the target distribution we can tune a model to approximate it. We do this by minimizing the divergence to the target distribution. While techniques such as reinforcement learning from human feedback (RLHF) are restricted to using one kind of divergence only (specifically, reverse KL divergence), **disco** is more general, allowing the use of the full class of f-divergences, including both forward and reverse KL divergence, Jensen-Shannon, and total variation distance.
+
+**Step 3: 💬 Generate content that matches the preferences** 
+
+The resulting model can generate samples directly from a close approximation of the target distribution. Furthermore, it can be used jointly with Quasi-Rejection Sampling (QRS), a Monte Carlo sampling technique that allows the generation of samples that are even more representative of the target distribution.
 Alternatively, it is then possible to use decoding methods such as nucleus sampling, top-k sampling, or beam search, which would return samples from a further updated target distribution.
 
 See the references below for more theoretical and technical details.
@@ -284,6 +290,18 @@ The **disco** toolkit implements the theoretical framework presented in the foll
   - Controlling Conditional Language Models without Catastrophic Forgetting, Korbak et al., 2022, <https://proceedings.mlr.press/v162/korbak22a.html>, ICML;
   - On Reinforcement Learning and Distribution Matching for Fine-Tuning Language Models with no Catastrophic Forgetting, Korbak et al., 2022, <https://openreview.net/forum?id=XvI6h-s4un>, NeurIPS;
   - Aligning Language Models with Preferences through f-divergence Minimization, Go et al., 2023, https://arxiv.org/abs/2302.08215, ICML.
+
+To cite **disco**, please use:
+```
+@misc{kruszewski2023disco,
+      title={disco: a toolkit for Distributional Control of Generative Models}, 
+      author={Germán Kruszewski and Jos Rozen and Marc Dymetman},
+      year={2023},
+      eprint={2303.05431},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL}
+}
+```
 
 ## License
 

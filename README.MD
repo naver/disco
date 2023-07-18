@@ -4,7 +4,7 @@ The 🕺🏽 **disco** toolkit allows to control language models and other gener
 
 To achieve this, **disco** decouples the problem of expressing _what_ properties the model should have from _how_ to actually get the desired model as separate steps.
 
-**Step 1: ⚓ We express how the target distribution *should* be** 
+**Step 1: ⚓ We express how the target distribution *should* be**
 
 First, we define some feature over the generated samples that matters to us. It can be anything we can compute. For example, on a language model it can be as simple as whether the generated text contains a certain word or as complex as the compilability of some generated piece of code. Importantly, there is no need for the feature to be differentiable.
 
@@ -12,11 +12,11 @@ Then, we can express our preferences on the target distribution by deciding how 
 
 The resulting representation of the target distribution can *score* samples, but cannot directly be used to *generate* them.
 
-**Step 2: 🎯 Approximate the target distribution** 
+**Step 2: 🎯 Approximate the target distribution**
 
 To generate samples from the target distribution we can tune a model to approximate it. We do this by minimizing the divergence to the target distribution. While techniques such as reinforcement learning from human feedback (RLHF) are restricted to using one kind of divergence only (specifically, reverse KL divergence), **disco** is more general, allowing the use of the full class of f-divergences, including both forward and reverse KL divergence, Jensen-Shannon, and total variation distance.
 
-**Step 3: 💬 Generate content that matches the preferences** 
+**Step 3: 💬 Generate content that matches the preferences**
 
 The resulting model can generate samples directly from a close approximation of the target distribution. Furthermore, it can be used jointly with Quasi-Rejection Sampling (QRS), a Monte Carlo sampling technique that allows the generation of samples that are even more representative of the target distribution.
 Alternatively, it is then possible to use decoding methods such as nucleus sampling, top-k sampling, or beam search, which would return samples from a further updated target distribution.
@@ -293,13 +293,19 @@ The **disco** toolkit implements the theoretical framework presented in the foll
 
 To cite **disco**, please use:
 ```
-@misc{kruszewski2023disco,
-      title={disco: a toolkit for Distributional Control of Generative Models}, 
-      author={Germán Kruszewski and Jos Rozen and Marc Dymetman},
-      year={2023},
-      eprint={2303.05431},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL}
+@inproceedings{kruszewski-etal-2023-disco,
+    title = "disco: a toolkit for Distributional Control of Generative Models",
+    author = "Kruszewski, Germ{\'a}n  and
+      Rozen, Jos  and
+      Dymetman, Marc",
+    booktitle = "Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 3: System Demonstrations)",
+    month = jul,
+    year = "2023",
+    address = "Toronto, Canada",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2023.acl-demo.14",
+    pages = "144--160",
+    abstract = "Pre-trained language models and other generative models have revolutionized NLP and beyond. However, these models tend to reproduce undesirable biases present in their training data. Also, they may overlook patterns that are important but challenging to capture. To address these limitations, researchers have introduced distributional control techniques. These techniques, not limited to language, allow controlling the prevalence (i.e. expectations) of any features of interest in the model{'}s outputs. Despite their potential, the widespread adoption of these techniques has been hindered by the difficulty in adapting the complex, disconnected code. Here, we present disco, an open-source Python library that brings these techniques to the broader public",
 }
 ```
 

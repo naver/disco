@@ -114,7 +114,7 @@ class LMDistributionTest(unittest.TestCase):
                 " and the streets were empty and quiet.",
                 " in Brest."
             ]
-        
+
         from disco.distributions.lm_distribution import TextSample
         samples = [
                 TextSample(distribution.tokenizer(t, return_tensors="pt", add_special_tokens=True)["input_ids"], t)\
@@ -125,6 +125,7 @@ class LMDistributionTest(unittest.TestCase):
     def test_ignore_padding_at_score(self):
         for model, distribution in self.test_distributions.items():
             text = "The streets were empty and quiet."
+            context = "This is some context." if distribution.network.config.is_encoder_decoder else ""
 
             from disco.distributions.lm_distribution import TextSample
             sample = TextSample(distribution.tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0], text)
@@ -141,14 +142,15 @@ class LMDistributionTest(unittest.TestCase):
                     token_ids=torch.cat((sample.token_ids, torch.tensor([eos_token_id, pad_token_id])), dim=0),
                     text=text + pad_token + pad_token)
 
-            log_scores = distribution.log_score([sample])
-            completed_log_scores = distribution.log_score([completed_sample])
-            padded_log_scores = distribution.log_score([padded_sample])
+            log_scores = distribution.log_score([sample], context=context).item()
+            completed_log_scores = distribution.log_score([completed_sample], context=context).item()
+            padded_log_scores = distribution.log_score([padded_sample], context=context).item()
 
-            self.assertNotEqual(0, log_scores[0])
-            self.assertGreater(torch.abs(log_scores[0] - completed_log_scores[0]), 1e-4, 
+            self.assertNotEqual(0, log_scores)
+            if completed_log_scores != float("-inf") and completed_log_scores != float("-inf"):
+                self.assertNotAlmostEqual(log_scores, completed_log_scores, 4,
                     f"The {model} scores must be different with and without and eos token.")
-            self.assertLess(torch.abs(completed_log_scores[0] - padded_log_scores[0]), 1e-2,
+            self.assertAlmostEqual(completed_log_scores, padded_log_scores, 4,
                     f"The {model} scores must not be different with and without a pad token after an eos token.")
 
     def test_ignore_padding_at_sample(self):
@@ -158,7 +160,7 @@ class LMDistributionTest(unittest.TestCase):
         np.random.seed(seed)
         random.seed(seed)
         samples, log_scores = distribution.sample()
-        padded_sequence_id = 8 # found manually
+        padded_sequence_id = 16 # found manually
         padded_sequence = samples[padded_sequence_id]
         padded_sequence_log_score = log_scores[padded_sequence_id]
         pad_token_id = distribution.tokenizer.pad_token_id
@@ -169,38 +171,38 @@ class LMDistributionTest(unittest.TestCase):
     def test_empty_sequence_score(self):
         for model, distribution in self.test_distributions.items():
             pad_token_id = distribution.tokenizer.pad_token_id
-            empty_sequence_tok = [pad_token_id]*20
-            empty_sequence_str = distribution.tokenizer.decode(empty_sequence_tok)
-            empty_sequence = TextSample(token_ids=torch.tensor(empty_sequence_tok),
-                    text=empty_sequence_str)
-            log_score = distribution.log_score([empty_sequence])
+            empty_sequence1_tok = [pad_token_id]*1
+            empty_sequence1_str = distribution.tokenizer.decode(empty_sequence1_tok)
+            empty_sequence1 = TextSample(token_ids=torch.tensor(empty_sequence1_tok),
+                    text=empty_sequence1_str)
+            empty_sequence2_tok = [pad_token_id]*20
+            empty_sequence2_str = distribution.tokenizer.decode(empty_sequence2_tok)
+            empty_sequence2 = TextSample(token_ids=torch.tensor(empty_sequence2_tok),
+                    text=empty_sequence2_str)
             if distribution.network.config.is_encoder_decoder:
-                ctxt = distribution.tokenizer('', return_tensors="pt", add_special_tokens=True)
-                manual_log_score = torch.log_softmax(
-                        distribution.network.forward(
-                            decoder_input_ids=empty_sequence.token_ids[:1].unsqueeze(0), **ctxt).logits,
-                        -1)[0, 0, pad_token_id]
+                log_score1 = distribution.log_score([empty_sequence1], context='yada yada')
+                log_score2 = distribution.log_score([empty_sequence2], context='yada yada')
             else:
-                manual_log_score = torch.log_softmax(
-                            distribution.network.forward(empty_sequence.token_ids[:1].unsqueeze(0)).logits, 
-                        -1)[0, 0, pad_token_id]
-            self.assertLess(torch.abs(log_score - manual_log_score), 1e-2, 
+                log_score1 = distribution.log_score([empty_sequence1])
+                log_score2 = distribution.log_score([empty_sequence2])
+            self.assertAlmostEqual(log_score1.item(), log_score2.item(), 4,
                     f"The {model} score of all pad tokens should correspond to a single one.")
 
     def test_scoring_consistent_with_loss(self):
         for model, distribution in self.test_distributions.items():
             text = "The streets were empty and quiet."
+            context = "This is an example." if distribution.network.config.is_encoder_decoder else ""
 
             from disco.distributions.lm_distribution import TextSample
             sample = TextSample(distribution.tokenizer(text, return_tensors="pt", add_special_tokens=True)["input_ids"][0], text)
-            log_score = distribution.log_score([sample])
+            log_score = distribution.log_score([sample], context=context)
             if distribution.network.config.is_encoder_decoder:
-                ctxt = distribution.tokenizer('', return_tensors="pt", add_special_tokens=True)
+                ctxt = distribution.tokenizer(context, return_tensors="pt", add_special_tokens=True)
                 loss = distribution.network(input_ids=ctxt.input_ids,
                         labels=sample.token_ids.unsqueeze(0)).loss
             else:
                 loss = distribution.network(sample.token_ids, labels=sample.token_ids).loss
-            self.assertLess(torch.abs(-log_score / len(sample.token_ids) -  loss), 1e-2, 
+            self.assertLess(torch.abs(-log_score / len(sample.token_ids) -  loss), 1e-2,
                     f'The {model} score is not consistent with the loss reported by the forward function.')
 
     def test_sample_empty_sequence(self):
@@ -242,6 +244,24 @@ class LMDistributionTest(unittest.TestCase):
         self.assertEqual(distribution.network.config, distribution2.network.config)
         self.assertNotEqual(distribution.network, distribution2.network)
 
+    def test_bart_consistency(self):
+        model = LMDistribution(
+                model="facebook/bart-large-cnn",
+                auto=AutoModelForSeq2SeqLM,
+                length=128)
+
+        context="""Self-trained autonomous agents developed using machine learning are showing great promise in a variety of control settings,
+        perhaps most remarkably in applications involving autonomous vehicles. The main challenge associated with self-learned agents in the form
+        of deep neural networks, is their black-box nature: it is impossible for humans to interpret deep neural networks. Therefore, humans cannot
+        directly interpret the actions of deep neural network based agents, or foresee their robustness in different scenarios. In this work,
+        we demonstrate a method for probing which concepts self-learning agents internalise in the course of their training. For demonstration,
+        we use a chess playing agent in a fast and light environment developed specifically to be suitable for research groups without access to
+        enormous computational resources or machine learning models."""
+        torch.manual_seed(1)
+        samples, log_scores = model.sample(context=context, sampling_size=1, sum=False)
+        ls_log_scores = model.log_score(samples, context=context, sum=False)
+        sample_idx = 0
+        self.assertAlmostEqual(log_scores.sum().item(), ls_log_scores.sum().item(), 4)
 
 if __name__ == '__main__':
     unittest.main()

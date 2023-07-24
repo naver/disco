@@ -6,7 +6,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='disco-generation',
-    version='1.1.0',
+    version='1.1.1',
     description='A toolkit for distributional control of generative models',
     url='https://github.com/naver/disco',
     author='Naver Labs Europe', author_email='jos.rozen@naverlabs.com',

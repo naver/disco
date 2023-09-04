@@ -26,8 +26,8 @@ class PipelineScorer(PositiveScorer):
         self.pipeline = pipeline(**params)
         self.temperature = temperature
 
-    def log_score(self, samples, _):
-        """computes the log-scores of the samples
+    def score(self, samples, _):
+        """computes the scores of the samples
         from the label returned by the pipeline
 
         Parameters
@@ -37,9 +37,9 @@ class PipelineScorer(PositiveScorer):
 
         Returns
         -------
-        tensor of log-probabilities"""
+        tensor of scores"""
 
-        return torch.log(
+        return (
                 torch.tensor(
                     [[r_i["score"] for r_i in r if self.label == r_i["label"]][0]
                     for r in self.pipeline([s.text for s in samples], return_all_scores=True)]

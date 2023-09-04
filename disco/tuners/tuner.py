@@ -187,7 +187,7 @@ class Tuner():
         logweights = model_log_scores - proposal_log_scores
         importance_ratios = torch.exp(logweights)
         for (label, feature) in self.features:
-            proposal_moment_pointwise_estimates = feature.log_score(samples, context).exp().to(device)
+            proposal_moment_pointwise_estimates = feature.score(samples, context).to(device)
             self.features_moments_proposal[label][context] += proposal_moment_pointwise_estimates
             self.features_moments_target[label][context] += importance_ratios * proposal_moment_pointwise_estimates
 

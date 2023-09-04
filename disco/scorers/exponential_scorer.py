@@ -54,7 +54,7 @@ class ExponentialScorer(PositiveScorer):
         device = get_device(self.coefficients)
 
         feature_log_scores = torch.stack(
-                ([feature.score(samples, context).to(device) for feature in self.features])
+                ([feature.log_score(samples, context).to(device) for feature in self.features])
             ) # [n_features, n_samples]
         weighted_log_scores = self.coefficients.repeat(len(samples), 1) * feature_log_scores.t()
 

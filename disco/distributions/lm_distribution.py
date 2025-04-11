@@ -207,7 +207,8 @@ class LMDistribution(BaseDistribution):
         generation_config = copy.deepcopy(self.network.generation_config)
         generation_config.update(**self.params)
 
-        logits_warper = self.network._get_logits_warper(generation_config)
+        generation_config, model_kwargs = self.network._prepare_generation_config(generation_config)
+        self.network._prepare_special_tokens(generation_config, False, self.network.device)
 
         logits_processor = self.network._get_logits_processor(
             generation_config=generation_config,
@@ -219,7 +220,6 @@ class LMDistribution(BaseDistribution):
 
         for i in range(all_logits.shape[1]): # [n_samples, length, vocab]
             all_logits[:,i,:] = logits_processor(input_ids[:,:i+1], all_logits[:,i,:])
-            all_logits[:,i,:] = logits_warper(input_ids[:,:i+1], all_logits[:,i,:])
 
         return all_logits
 

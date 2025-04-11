@@ -73,9 +73,10 @@ class LMDistribution(BaseDistribution):
 
     def _load_network(self, auto, model):
         self.network = auto.from_pretrained(model)
-        if not self.network.config.is_encoder_decoder:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.network.config.pad_token_id = self.tokenizer.eos_token_id
+        if not self.network.config.is_encoder_decoder and self.tokenizer.pad_token_id is None:
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            self.network.resize_token_embeddings(len(self.tokenizer))
+            self.network.generation_config.pad_token_id = self.tokenizer.pad_token_id
 
     def to(self, device):
         self.device = device

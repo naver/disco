@@ -423,7 +423,7 @@ class Tuner():
         self.parameters_updated.dispatch(self.params)
         torch.cuda.empty_cache()
 
-        with trange(self.params["n_gradient_steps"], desc='fine-tuning') as t:
+        with trange(self.params["n_gradient_steps"], desc='fine-tuning', position=0) as t:
             for s in t:
                 self.step_idx_updated.dispatch(s)
                 self._step()

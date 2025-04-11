@@ -7,7 +7,7 @@ import tqdm.autonotebook as tqdm
 
 def batchify(func, batch, samples=list(), **args):
     all = []
-    with tqdm.tqdm(total=len(samples), desc=func.__name__) as pbar:
+    with tqdm.tqdm(total=len(samples), desc=func.__name__, position=1, leave=True) as pbar:
         for i in range(len(samples)//batch + 1):
             subsamples = samples[i * batch:(i+1) * batch]
             if subsamples:

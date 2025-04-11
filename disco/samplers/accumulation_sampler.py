@@ -41,7 +41,9 @@ class AccumulationSampler(Sampler):
         """
         with trange(
                 self.total_size,
-                desc=f"sampling from {type(self.distribution).__name__}"
+                desc=f"sampling from {type(self.distribution).__name__}",
+                position=1,
+                leave=False
             ) as t:
             remaining = self.total_size
             samples, log_scores = list(), torch.empty([0])

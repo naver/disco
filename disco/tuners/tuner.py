@@ -115,7 +115,7 @@ class Tuner():
             self.optimizer = torch.optim.Adam(self.model.network.parameters(), lr=self.params["learning_rate"])
 
         if "linear" == self.params["scheduler"]:
-            self.scheduler = get_linear_schedule_with_warmup(self.optimizer, self.params["warmup_steps"])
+            self.scheduler = get_linear_schedule_with_warmup(self.optimizer, self.params["warmup_steps"], self.params["n_gradient_steps"])
         elif "cosine" == self.params["scheduler"]:
             self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, self.params["warmup_steps"], self.params["n_gradient_steps"])
         else:

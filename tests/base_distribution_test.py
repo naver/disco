@@ -79,15 +79,15 @@ class BaseDistributionTest(unittest.TestCase):
         target = reference.constrain([even])
         self.assertEqual(Product, type(target),
             "constrain(...) should return a Product.")
-        self.assertTrue(all([-np.Inf == s for s in target.log_score(odds, None)]),
+        self.assertTrue(all([-np.inf == s for s in target.log_score(odds, None)]),
             "a base distribution should be constrainable with a single pointwise feature to build an EBM.")
-        self.assertTrue(all([-np.Inf < s < 0 for s in target.log_score(evens, None)]),
+        self.assertTrue(all([-np.inf < s < 0 for s in target.log_score(evens, None)]),
             "a base distribution should be constrainable with a single pointwise feature to build an EBM.")
 
     def test_constrain_pointwisely_with_multiple_features(self):
         reference = DummyDistribution()
         target = reference.constrain([even, divisible_by_3])
-        self.assertEqual(4, len([s for s in target.log_score(first_20_integers, None) if -np.Inf < s < 0]),
+        self.assertEqual(4, len([s for s in target.log_score(first_20_integers, None) if -np.inf < s < 0]),
             "a base distribution should be constrainable with multiple pointwise features to build an EBM.")
 
     def test_constrain_is_like_sugar_when_no_moment(self):

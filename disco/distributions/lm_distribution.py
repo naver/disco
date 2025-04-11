@@ -114,7 +114,7 @@ class LMDistribution(BaseDistribution):
         """
         assert self.scorable, "this distribution's parameters make it unscorable."
         shapes = set([s.token_ids.shape for s in samples])
-        assert 1 == len(shapes), "sequences of token_ids should have the same shape, but got: {shapes}."
+        assert 1 == len(shapes), f"sequences of token_ids should have the same shape, but got: {shapes}."
 
         if self.network.config.is_encoder_decoder:
             assert context is not None and context != "", "context (encoder input) is mandatory for encoder-decoder models"

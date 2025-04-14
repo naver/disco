@@ -21,8 +21,8 @@ class PositiveScorer(Scorer):
         return Product(self, ot)
 
     def log_score(self, samples, context):
-        """relies on the instance's scoring function
-        to compute the log-scores of the samples given the context
+        """returns the log-scores for the samples
+        given the context by taking the log of their scores
 
         Parameters
         ----------
@@ -35,11 +35,11 @@ class PositiveScorer(Scorer):
         -------
         tensor of log-scores for the samples"""
 
-        return torch.log(self.scoring_function(samples, context))
+        return torch.log(self.score(samples, context=context))
 
     def score(self, samples, context):
-        """returns the scores for the samples
-        given the context by exponentiating their log-scores
+        """relies on the instance's scoring function
+        to compute the scores of the samples given the context
 
         Parameters
         ----------
@@ -52,7 +52,7 @@ class PositiveScorer(Scorer):
         -------
         tensor of scores for the samples"""
 
-        return torch.exp(self.log_score(samples, context=context))
+        return self.scoring_function(samples, context)
 
 
 class Product(PositiveScorer):
@@ -84,7 +84,7 @@ class Product(PositiveScorer):
             device = "cpu"
 
         log_scores = [s.log_score(samples, context=context).to(device) for s in self.scorers]
-        return torch.tensor(reduce(lambda x,y: x+y, log_scores))
+        return reduce(lambda x,y: x+y, log_scores)
 
     def __str__(self):
         scorers_str = ", ".join((str(scorer) for scorer in self.scorers))

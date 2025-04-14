@@ -28,7 +28,7 @@ class BaseDistribution(Distribution):
 
     def constrain(self,
             features, moments=None,
-            proposal=None, context_distribution=SingleContextDistribution(''), context_sampling_size=1,
+            proposal=None, context_distribution=SingleContextDistribution(''), n_contexts_per_step=1,
             n_samples=2**9, iterations=1000, learning_rate=0.05, tolerance=1e-5, sampling_size=2**5
         ):
         """
@@ -45,8 +45,8 @@ class BaseDistribution(Distribution):
             distribution to sample from, if different from self
         context_distribution: distribution
             to contextualize the sampling and scoring
-        context_sampling_size:
-            size of the batch when sampling context
+        n_contexts_per_step:
+            number of contexts sampled for each gradient step
         n_samples: int
             number of samples to use to fit the coefficients
         learning_rate: float
@@ -79,7 +79,7 @@ class BaseDistribution(Distribution):
         if not proposal:
             proposal = self
 
-        context_samples, context_log_scores = context_distribution.sample(context_sampling_size)
+        context_samples, context_log_scores = context_distribution.sample(n_contexts_per_step)
 
         proposal_samples = dict()
         proposal_log_scores = dict()

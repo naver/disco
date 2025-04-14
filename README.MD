@@ -152,7 +152,7 @@ for s in samples:
 Important parameters of the `Tuner` include:
 
 - `n_gradient_steps`: number of total gradient steps in the full tuning process;
-- `n_samples_per_step`: total number of samples used in performing a gradient step (aka batch size);
+- `n_samples_per_context`: total number of samples used in performing a gradient step (aka batch size);
 - `scoring_size`: number of samples sent in a batch to the `.score` function. This parameter affects training speed or helps solve GPU memory errors, but does not affect final results;
 - `sampling_size`: number of samples obtained from a single call to the `.sample` function. This parameter affects training speed or helps solve GPU memory errors, but does not affect final results;
 - `features`: list of pairs (`name`, `feature`) so that the `feature` moments will be computed by importance sampling (and reported using the key given by `name`);
@@ -199,7 +199,7 @@ model = LMDistribution(freeze=False)
 
 tuner = CDPGTuner(model, target_ebm,
   context_distribution=ContextDistribution("data/incipits.txt"),
-  context_sampling_size=2**3)
+  n_contexts_per_step=2**3)
 tuner.tune()
 ```
 
@@ -226,7 +226,7 @@ model = LMDistribution(freeze=False)
 
 tuner = FCDPGTuner(model, target_ebm, loss=JSLoss(),
   context_distribution=ContextDistribution("data/incipits.txt"),
-  context_sampling_size=2**3)
+  n_contexts_per_step=2**3)
 tuner.tune()
 ```
 

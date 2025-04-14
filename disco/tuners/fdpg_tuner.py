@@ -29,7 +29,7 @@ class FDPGTuner(Tuner):
         super(FDPGTuner, self).__init__(
                 *args,
                 context_distribution=SingleContextDistribution(context),
-                context_sampling_size=1,
+                n_contexts_per_step=1,
                 loss=loss,
                 **kwargs
             )

@@ -55,10 +55,10 @@ class Tuner():
         "scheduler": "constant",
         "warmup_steps":2*6,
         "n_gradient_steps": 2**10, # number of gradient updates
-        "n_samples_per_step": 2**10, # number of samples used per update step
+        "n_samples_per_context": 2**10, # number of samples generated for each context
         "scoring_size": 2**6, # number of samples used for one computation of the loss
         "sampling_size": 2**5, # number of samples requested per sampling
-        "context_sampling_size": 2**4, # number of different contexts to sample
+        "n_contexts_per_step": 2**4, # number of different contexts to sample per gradient step
         "divergence_evaluation_interval": 2**4, # number of gradient steps between evaluation of divergence
                                                 # (also used to eventually update proposal when offline tuning)
         "proposal_update_metric": "kl" # the proposal will be updated if the model is better according to this metric
@@ -370,10 +370,10 @@ class Tuner():
           - applies the accumulated gradients
     
         """
-        sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_step"])
-        n_steps = self.params["n_samples_per_step"] // self.params["scoring_size"]
+        sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
+        n_steps = self.params["n_samples_per_context"] // self.params["scoring_size"]
 
-        contexts, _ = self.context_distribution.sample(self.params["context_sampling_size"])
+        contexts, _ = self.context_distribution.sample(self.params["n_contexts_per_step"])
 
         for context in contexts:
 
@@ -406,7 +406,7 @@ class Tuner():
 
                 self._compute_gradient(
                     mb_samples, mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores,
-                    context, n_steps * self.params["context_sampling_size"])
+                    context, n_steps * self.params["n_contexts_per_step"])
         
         self.optimizer.step()
         self.scheduler.step()

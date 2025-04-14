@@ -32,8 +32,8 @@ class TunerTest(unittest.TestCase):
         rlhf_target = base * ExponentialScorer([reward], [0.1])
         loss = loss_cls()
         tuner = Tuner(model, rlhf_target, loss=loss, n_gradient_steps=1,
-                context_sampling_size=1,
-                n_samples_per_step=32,
+                n_contexts_per_step=1,
+                n_samples_per_context=32,
                 scoring_size=32)
         with MockObserver(tuner) as obs:
             tuner.tune()
@@ -45,7 +45,7 @@ class TunerTest(unittest.TestCase):
         target = base.constrain([scorer], [0.5])
         model = LMDistribution(freeze=False)
         tuner = DPGTuner(model, target, n_gradient_steps=1,
-                n_samples_per_step=32,
+                n_samples_per_context=32,
                 scoring_size=32)
         with MockObserver(tuner) as obs:
             tuner.tune()
@@ -60,8 +60,8 @@ class TunerTest(unittest.TestCase):
         tuner = CDPGTuner(model, target,
                 context_distribution=context_distribution,
                 n_gradient_steps=1,
-                context_sampling_size=1,
-                n_samples_per_step=1,
+                n_contexts_per_step=1,
+                n_samples_per_context=1,
                 scoring_size=1)
         with MockObserver(tuner) as obs:
             tuner.tune()
@@ -73,7 +73,7 @@ class TunerTest(unittest.TestCase):
         target = base.constrain([scorer], [0.5])
         model = LMDistribution(freeze=False)
         tuner = FDPGTuner(model, target, n_gradient_steps=1,
-                n_samples_per_step=1,
+                n_samples_per_context=1,
                 scoring_size=1)
         with MockObserver(tuner) as obs:
             tuner.tune()
@@ -88,8 +88,8 @@ class TunerTest(unittest.TestCase):
         tuner = FCDPGTuner(model, target,
                 context_distribution=context_distribution,
                 n_gradient_steps=1,
-                context_sampling_size=1,
-                n_samples_per_step=1,
+                n_contexts_per_step=1,
+                n_samples_per_context=1,
                 scoring_size=1)
         with MockObserver(tuner) as obs:
             tuner.tune()
@@ -104,8 +104,8 @@ class TunerTest(unittest.TestCase):
         tuner = FCDPGTuner(model, target,
                 context_distribution=context_distribution,
                 n_gradient_steps=1,
-                context_sampling_size=1,
-                n_samples_per_step=128,
+                n_contexts_per_step=1,
+                n_samples_per_context=128,
                 divergence_evaluation_interval=1,
                 scoring_size=32,
                 features=[('amazing', scorer)])
@@ -120,8 +120,8 @@ class TunerTest(unittest.TestCase):
         tuner = FCDPGTuner(model, target,
                 context_distribution=context_distribution,
                 n_gradient_steps=1,
-                context_sampling_size=1,
-                n_samples_per_step=1,
+                n_contexts_per_step=1,
+                n_samples_per_context=1,
                 scoring_size=1)
         with MockObserver(tuner) as obs:
             tuner.tune()

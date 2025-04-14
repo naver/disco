@@ -39,7 +39,7 @@ class PositiveScorer(Scorer):
 
     def score(self, samples, context):
         """returns the scores for the samples
-        given the context by exponentiating their log-scores 
+        given the context by exponentiating their log-scores
 
         Parameters
         ----------
@@ -52,7 +52,7 @@ class PositiveScorer(Scorer):
         -------
         tensor of scores for the samples"""
 
-        return torch.exp(self.log_score(samples, context))
+        return torch.exp(self.log_score(samples, context=context))
 
 
 class Product(PositiveScorer):
@@ -82,11 +82,10 @@ class Product(PositiveScorer):
             device = self.scorers[0].device
         except AttributeError:
             device = "cpu"
-        
-        log_scores = [s.log_score(samples, context).to(device) for s in self.scorers]
+
+        log_scores = [s.log_score(samples, context=context).to(device) for s in self.scorers]
         return torch.tensor(reduce(lambda x,y: x+y, log_scores))
 
     def __str__(self):
         scorers_str = ", ".join((str(scorer) for scorer in self.scorers))
         return f"Product({scorers_str})"
-    

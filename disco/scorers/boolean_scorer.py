@@ -38,7 +38,7 @@ class BooleanScorer(PositiveScorer):
         -------
         tensor of (-np.Inf / 0) log-probabilities"""
 
-        return torch.log(self.score(samples, context))
+        return torch.log(self.score(samples, context=context))
 
     def score(self, samples, context):
         """Computes probabilities for samples and context

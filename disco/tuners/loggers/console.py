@@ -10,7 +10,9 @@ from tqdm.autonotebook import tqdm
 class ConsoleLogger(BaseTunerObserver):
     def __init__(self, tuner):
         super(ConsoleLogger, self).__init__(tuner)
-        self.ministeps_pbar = tqdm(total=tuner.params["n_samples_per_step"]//tuner.params["sampling_size"])
+        tuner.proposal_updated.enroll(self.on_proposal_updated)
+        self.n = tuner.params["n_gradient_steps"]
+        self.step = None
 
     def __exit__(self, *exc):
         stamp = datetime.now().strftime("%H:%M:%S (%Y/%m/%d)")
@@ -20,8 +22,15 @@ class ConsoleLogger(BaseTunerObserver):
         for k, v in params.items():
             print (f"{k}: ", v)
 
-    def on_step_idx_updated(self, s):
-        self.ministeps_pbar.reset()
+    def on_eval_samples_updated(self, context, samples, proposal_log_scores, model_log_scores, target_log_scores):
+        tqdm.write(f"Context: {context}")
+        tqdm.write("Samples:")
+        tqdm.write("\n".join(s.text for s in samples[:3]))
 
-    def on_ministep_idx_updated(self, s):
-        self.ministeps_pbar.update(1)
+    def on_step_idx_updated(self, s):
+        self.step = s
+        tqdm.write(f"Step {s}/{self.n}")
+
+    def on_proposal_updated(self, proposal, divergence_metric, divergence_target_new, divergence_target_old):
+        tqdm.write(f"updating proposal according to {divergence_metric} divergence at step {self.step}: "
+                   f"{divergence_target_new} < {divergence_target_old}")

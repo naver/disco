@@ -324,12 +324,14 @@ class Tuner():
             Checks if D(p||.) is lower for model than for the proposal
             and if so, updates the proposal
         """
-        if average(self.divergence_estimates_target_proposal[self.params["proposal_update_metric"]]) > \
-                average(self.divergence_estimates_target_model[self.params["proposal_update_metric"]]):
-            print("updating proposal according to KL divergence")
+        divergence_target_proposal = average(self.divergence_estimates_target_proposal[self.params["proposal_update_metric"]])
+        divergence_target_model = average(self.divergence_estimates_target_model[self.params["proposal_update_metric"]])
+        if divergence_target_proposal > \
+                divergence_target_model:
             self.proposal.network.load_state_dict(self.model.network.state_dict())
             self.metric_updated.dispatch('proposal_updated', 1)
-            self.proposal_updated.dispatch(self.proposal)
+            self.proposal_updated.dispatch(self.proposal, self.params['proposal_update_metric'],
+                                            divergence_target_model, divergence_target_proposal)
         else:
             self.metric_updated.dispatch('proposal_updated', 0)
 
@@ -411,6 +413,7 @@ class Tuner():
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
+        self.metric_updated.dispatch('lr', self.scheduler.get_last_lr()[0])
 
     def tune(self):
         """

@@ -2,7 +2,7 @@
 # Copyright (C) 2022-present NAVER Corp.
 # Creative Commons Attribution-NonCommercial-ShareAlike 4.0 license
 
-import neptune.new as neptune
+import neptune
 import os
 from .base import BaseTunerObserver
 
@@ -36,7 +36,7 @@ class NeptuneLogger(BaseTunerObserver):
         super(NeptuneLogger, self).__init__(tuner)
         if not 'proxies' in kwargs:
             kwargs['proxies'] = get_proxies()
-        self.run = neptune.init(project=project, 
+        self.run = neptune.init_run(project=project, 
                 name=name,
                 api_token=api_token,
                 **kwargs)
@@ -61,6 +61,3 @@ class NeptuneLogger(BaseTunerObserver):
 
     def on_step_idx_updated(self, s):
         self.run["steps"].log(s)
-
-    def on_ministep_idx_updated(self, s):
-        self.run["ministeps"].log(s)

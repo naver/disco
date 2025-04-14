@@ -44,7 +44,4 @@ class WandBLogger(BaseTunerObserver):
         wandb.log({"samples": [s.text for s in samples[:10]]})
 
     def on_step_idx_updated(self, s):
-        wandb.log({"steps": s})    
-
-    def on_ministep_idx_updated(self, m):
-        wandb.log({"ministeps": m})
+        wandb.log({"steps": s})

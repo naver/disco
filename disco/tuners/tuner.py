@@ -92,6 +92,8 @@ class Tuner():
         """
         self.params = self.default_params
         self.params.update(params)
+        self.params['scoring_size'] = min(self.params['scoring_size'], self.params['n_samples_per_context'])
+        self.params['sampling_size'] = min(self.params['sampling_size'], self.params['n_samples_per_context'])
         self.target  = target
         if proposal:
             self.proposal = proposal

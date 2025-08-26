@@ -4,6 +4,7 @@
 
 import torch
 import copy
+import time
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, LogitsProcessorList
 
 from collections import namedtuple
@@ -45,9 +46,14 @@ class LMDistribution(BaseDistribution):
             parameters and values passed to transformers' ```generate(…)```
         """
 
-        self.tokenizer= AutoTokenizer.from_pretrained(tokenizer if tokenizer else model)
-        assert auto in [AutoModelForCausalLM, AutoModelForSeq2SeqLM], "only AutoModel, AutoModelForCausalLM and AutoModelForSeq2SeqLM are valid options."
-        self._load_network(auto, model)
+        if isinstance(model, str):
+            # assume also the tokenizer is a str
+            self.tokenizer= AutoTokenizer.from_pretrained(tokenizer if tokenizer else model)
+            assert auto in [AutoModelForCausalLM, AutoModelForSeq2SeqLM], "only AutoModel, AutoModelForCausalLM and AutoModelForSeq2SeqLM are valid options."
+            self._load_network(auto, model, device)
+        else:
+            self.tokenizer = tokenizer
+            self.network = model
 
         self.device = device
         self.network.to(self.device)
@@ -71,8 +77,11 @@ class LMDistribution(BaseDistribution):
                 [default_params[k] == self.params[k] for k in default_params.keys()]\
             ) else False
 
-    def _load_network(self, auto, model):
-        self.network = auto.from_pretrained(model)
+    def _load_network(self, auto, model, device):
+        print(f"Loading model to {device}")
+        t0 = time.time()
+        self.network = auto.from_pretrained(model, device_map=device, trust_remote_code=True, use_safetensors=True)
+        print(f"Model loaded in {time.time() - t0:.0f}s.", )
         if not self.network.config.is_encoder_decoder and self.tokenizer.pad_token_id is None:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
             self.network.resize_token_embeddings(len(self.tokenizer))

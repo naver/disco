@@ -3,7 +3,7 @@
 # Creative Commons Attribution-NonCommercial-ShareAlike 4.0 license
 
 import torch
-from tqdm.autonotebook import trange
+from tqdm.auto import trange, tqdm
 from collections import defaultdict
 from transformers import (get_constant_schedule_with_warmup,
                         get_linear_schedule_with_warmup,
@@ -12,7 +12,6 @@ from transformers import (get_constant_schedule_with_warmup,
 
 from disco.tuners.losses import *
 from disco.samplers import AccumulationSampler
-from disco.distributions.single_context_distribution import SingleContextDistribution
 from disco.metrics import KL, TV, JS
 from disco.utils.helpers import batchify
 from disco.utils.observable import Observable, forward
@@ -22,7 +21,7 @@ from disco.utils.moving_average import average
 
 divergence_pointwise_estimates_funcs = {
         'tv': TV.pointwise_estimates,
-        'kl': KL.pointwise_estimates, 
+        'kl': KL.pointwise_estimates,
         'js': JS.pointwise_estimates}
 
 
@@ -64,7 +63,7 @@ class Tuner():
         "proposal_update_metric": "kl" # the proposal will be updated if the model is better according to this metric
     }
 
-    def __init__(self, model, target, proposal=None, context_distribution=SingleContextDistribution(), loss=JSLoss(), features=[], 
+    def __init__(self, model, target, proposal=None, context_dataset=None, loss=JSLoss(), features=[],
             track_metrics=["kl", "tv", "js"], track_divergence_from_base=False, **params):
         """
         Parameters
@@ -72,8 +71,8 @@ class Tuner():
         model: distribution
             model distribution, to be tuned
         target: product
-            EBM made of a distribution and one or multiple (log-)scorers 
-        proposal: distribution  
+            EBM made of a distribution and one or multiple (log-)scorers
+        proposal: distribution
             sampling distribution, if specified tuning is offline
             else online (model is also used to sample from)
         context_distribution: distribution
@@ -83,7 +82,7 @@ class Tuner():
         features: list of (label, feature)
             feature monitored during the tuning
         track_metrics: list of strings
-            metrics used to report differences between the target and the 
+            metrics used to report differences between the target and the
             model/proposal distributions.
         track_divergence_from_base: boolean
             whether or not track divergence from the base model of the EBM
@@ -103,7 +102,9 @@ class Tuner():
             self.learning = "online"
         self.model = model
 
-        self.context_distribution = context_distribution
+        self.context_dataloader = torch.utils.data.DataLoader(context_dataset, batch_size=self.params["n_contexts_per_step"], shuffle=True, collate_fn=lambda x: x)
+        self.context_iterator = iter(self.context_dataloader)
+
 
         self._loss = loss
 
@@ -195,7 +196,7 @@ class Tuner():
 
     def _update_moving_z(self, proposal_log_scores, target_log_scores, context):
         """
-        Improves the `z` importance sampling estimate of Z 
+        Improves the `z` importance sampling estimate of Z
         by averaging new samples
 
         Parameters
@@ -211,7 +212,7 @@ class Tuner():
 
         z_pointwise_estimates = torch.exp(target_log_scores - proposal_log_scores)
         self.z[context] += z_pointwise_estimates
-        self.metric_updated.dispatch('z', average(self.z))
+        self.metric_updated.dispatch('z', self.z[context])
 
     def _update_divergence_estimates_target_proposal(self, proposal_log_scores, target_log_scores, context):
         """
@@ -372,14 +373,13 @@ class Tuner():
           - obtains samples and their log-scores from the proposal network
           - repeats gradient computations, with minibatches
           - applies the accumulated gradients
-    
+
         """
         sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
         n_steps = self.params["n_samples_per_context"] // self.params["scoring_size"]
+        contexts = self._get_next_context_batch()
 
-        contexts, _ = self.context_distribution.sample(self.params["n_contexts_per_step"])
-
-        for context in contexts:
+        for context in tqdm(contexts, desc="Contexts", leave=False):
 
             samples, proposal_log_scores = sampler.sample(sampling_size=self.params["sampling_size"], context=context)
             target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)
@@ -411,11 +411,20 @@ class Tuner():
                 self._compute_gradient(
                     mb_samples, mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores,
                     context, n_steps * self.params["n_contexts_per_step"])
-        
+
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
         self.metric_updated.dispatch('lr', self.scheduler.get_last_lr()[0])
+
+    def _get_next_context_batch(self):
+        try:
+            batch = next(self.context_iterator)
+        except StopIteration:
+            # Restart the iterator when dataset is exhausted
+            self.context_iterator = iter(self.context_dataloader)
+            batch = next(self.context_iterator)
+        return batch
 
     def tune(self):
         """

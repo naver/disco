@@ -18,6 +18,7 @@ from disco.utils.observable import Observable, forward
 from disco.utils.device import to_same_device, get_device
 from disco.utils.moving_average import WindowedMovingAverage, MovingAverage
 from disco.utils.moving_average import average
+from disco.utils.timer import Timer
 
 divergence_pointwise_estimates_funcs = {
         'tv': TV.pointwise_estimates,
@@ -401,11 +402,14 @@ class Tuner():
 
             # obtain samples conditioned on this context
             sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
-            samples, proposal_log_scores = sampler.sample(sampling_size=self.params["sampling_size"], context=context)
+            with Timer() as t_sampling:
+                samples, proposal_log_scores = sampler.sample(sampling_size=self.params["sampling_size"], context=context)
+            self.metric_updated.dispatch("timing/generation_per_sample", t_sampling.elapsed / len(samples))
 
             # score the samples according to the target distribution
-            target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)
-            proposal_log_scores = batchify(self.proposal.log_score, self.params["scoring_size"], samples=samples, context=context)
+            with Timer() as t_scoring:
+                target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)
+            self.metric_updated.dispatch("timing/target_scoring_per_sample", t_scoring.elapsed / len(samples))
 
             # update importance sampling statistics
             self._update_moving_z(proposal_log_scores, target_log_scores, context)
@@ -435,9 +439,11 @@ class Tuner():
                 self.eval_samples_updated.dispatch(
                         context, mb_samples, mb_proposal_log_scores, mb_model_log_scores.detach(), mb_target_log_scores)
 
-                self._compute_gradient(
-                    mb_samples, mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores,
-                    context, n_steps * self.params["n_contexts_per_step"])
+                with Timer() as t_backprop:
+                    self._compute_gradient(
+                        mb_samples, mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores,
+                        context, n_steps * self.params["n_contexts_per_step"])
+                self.metric_updated.dispatch("timing/backpropagation_per_sample", t_backprop.elapsed / len(mb_samples))
 
                 mb_in_support = ~mb_target_log_scores.isneginf()
                 mb_in_support_target_norm_log_scores = mb_target_log_scores[mb_in_support] - \
@@ -478,7 +484,9 @@ class Tuner():
         with trange(self.params["n_gradient_steps"], desc='fine-tuning', position=0) as t:
             for s in t:
                 self.step_idx_updated.dispatch(s)
-                self._step()
+                with Timer() as step_t:
+                    self._step()
+                self.metric_updated.dispatch("timing/step", step_t.elapsed)
 
                 if  0 == (s + 1) % self.params["proposal_update_interval"]:
                     if "offline" == self.learning:

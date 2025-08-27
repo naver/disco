@@ -31,13 +31,16 @@ class JS(BaseDivergence):
             partition function of network 1
         proposal_log_scores: floats
             log-scores for samples according to proposal (by default m2_log_scores)
- 
+
         Returns
         -------
         divergence between m1 and m2
         """
 
         device = get_device(m1_log_scores)
+
+        if isinstance(z, float):
+            z = torch.tensor(z, device=device, dtype=m1_log_scores.dtype)
 
         m2_log_scores = m2_log_scores.to(device)
         normalized_m1_log_scores = m1_log_scores - torch.log(z)

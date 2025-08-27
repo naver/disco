@@ -16,7 +16,7 @@ from disco.metrics import KL, TV, JS
 from disco.utils.helpers import batchify
 from disco.utils.observable import Observable, forward
 from disco.utils.device import to_same_device, get_device
-from disco.utils.moving_average import MovingAverage
+from disco.utils.moving_average import WindowedMovingAverage, MovingAverage
 from disco.utils.moving_average import average
 
 divergence_pointwise_estimates_funcs = {
@@ -58,9 +58,9 @@ class Tuner():
         "scoring_size": 2**6, # number of samples used for one computation of the loss
         "sampling_size": 2**5, # number of samples requested per sampling
         "n_contexts_per_step": 2**4, # number of different contexts to sample per gradient step
-        "divergence_evaluation_interval": 2**4, # number of gradient steps between evaluation of divergence
-                                                # (also used to eventually update proposal when offline tuning)
-        "proposal_update_metric": "kl" # the proposal will be updated if the model is better according to this metric
+        "proposal_update_interval": 2**4, # number of gradient steps every which to update the proposal in offline learning
+        "proposal_update_metric": "kl", # the proposal will be updated if the model is better according to this metric
+        "estimates_rolling_window_size": 2**8 # number of samples to accumulate in a rollowing window estimate
     }
 
     def __init__(self, model, target, proposal=None, context_dataset=None, loss=JSLoss(), features=[],
@@ -89,6 +89,7 @@ class Tuner():
         params: dictionary
             fine-tuning parameters
         """
+        torch.autograd.set_detect_anomaly(True)
         self.params = self.default_params
         self.params.update(params)
         self.params['scoring_size'] = min(self.params['scoring_size'], self.params['n_samples_per_context'])
@@ -145,8 +146,8 @@ class Tuner():
             assert metric in divergence_pointwise_estimates_funcs, \
                     f"Unknown metric {metric}. " \
                     f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
-            self.divergence_estimates_target_proposal[metric] = defaultdict(MovingAverage)
-            self.divergence_estimates_target_model[metric] = defaultdict(MovingAverage)
+            self.divergence_estimates_target_proposal[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+            self.divergence_estimates_target_model[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
 
         self.track_divergence_from_base = track_divergence_from_base
         if self.track_divergence_from_base:
@@ -156,14 +157,14 @@ class Tuner():
                 assert metric in divergence_pointwise_estimates_funcs, \
                         f"Unknown metric {metric}. " \
                         f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
-                self.divergence_estimates_proposal_base[metric] = defaultdict(MovingAverage)
-                self.divergence_estimates_model_base[metric] = defaultdict(MovingAverage)
+                self.divergence_estimates_proposal_base[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+                self.divergence_estimates_model_base[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
 
         self.features_moments_proposal = dict()
         self.features_moments_target = dict()
         for (label, feature) in self.features:
-            self.features_moments_proposal[label] = defaultdict(MovingAverage)
-            self.features_moments_target[label] = defaultdict(MovingAverage)
+            self.features_moments_proposal[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+            self.features_moments_target[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
         if self.features:
             self.eval_samples_updated.enroll(self._update_features_moments)
 
@@ -191,8 +192,8 @@ class Tuner():
         importance_ratios = torch.exp(logweights)
         for (label, feature) in self.features:
             proposal_moment_pointwise_estimates = feature.log_score(samples, context=context).exp().to(device)
-            self.features_moments_proposal[label][context] += proposal_moment_pointwise_estimates
-            self.features_moments_target[label][context] += importance_ratios * proposal_moment_pointwise_estimates
+            self.features_moments_proposal[label].update(proposal_moment_pointwise_estimates)
+            self.features_moments_target[label].update(importance_ratios * proposal_moment_pointwise_estimates)
 
     def _update_moving_z(self, proposal_log_scores, target_log_scores, context):
         """
@@ -211,8 +212,8 @@ class Tuner():
         target_log_scores, proposal_log_scores = to_same_device(target_log_scores, proposal_log_scores)
 
         z_pointwise_estimates = torch.exp(target_log_scores - proposal_log_scores)
-        self.z[context] += z_pointwise_estimates
-        self.metric_updated.dispatch('z', self.z[context])
+        self.z[context].update(z_pointwise_estimates)
+        self.metric_updated.dispatch('z', self.z[context].value)
 
     def _update_divergence_estimates_target_proposal(self, proposal_log_scores, target_log_scores, context):
         """
@@ -232,9 +233,9 @@ class Tuner():
 
         if self.z[context].value > 0:
             for divergence_type, _ in self.divergence_estimates_target_proposal.items():
-                self.divergence_estimates_target_proposal[divergence_type][context] += \
+                self.divergence_estimates_target_proposal[divergence_type].update(
                     divergence_pointwise_estimates_funcs[divergence_type](
-                        target_log_scores, proposal_log_scores, self.z[context].value)
+                        target_log_scores, proposal_log_scores, self.z[context].value))
 
     def _update_divergence_estimates_target_model(self, proposal_log_scores, target_log_scores, model_log_scores, context):
         """
@@ -257,10 +258,10 @@ class Tuner():
 
         if self.z[context].value > 0:
             for divergence_type, _ in self.divergence_estimates_target_model.items():
-                self.divergence_estimates_target_model[divergence_type][context] += \
+                self.divergence_estimates_target_model[divergence_type].update(
                     divergence_pointwise_estimates_funcs[divergence_type](
                         target_log_scores, model_log_scores, self.z[context].value,
-                        proposal_log_scores=proposal_log_scores)
+                        proposal_log_scores=proposal_log_scores))
 
     def _update_divergence_estimates_proposal_base(self, proposal_log_scores, base_log_scores, context):
         """
@@ -279,9 +280,9 @@ class Tuner():
         base_log_scores, proposal_log_scores = to_same_device(base_log_scores, proposal_log_scores)
 
         for divergence_type, _ in self.divergence_estimates_target_proposal.items():
-            self.divergence_estimates_proposal_base[divergence_type][context] += \
+            self.divergence_estimates_proposal_base[divergence_type].update(
                 divergence_pointwise_estimates_funcs[divergence_type](
-                    proposal_log_scores, base_log_scores, torch.as_tensor(1), proposal_log_scores)
+                    proposal_log_scores, base_log_scores, torch.as_tensor(1), proposal_log_scores))
 
     def _update_divergence_estimates_model_base(self, proposal_log_scores, model_log_scores, base_log_scores, context):
         """
@@ -303,11 +304,11 @@ class Tuner():
                 to_same_device(model_log_scores, base_log_scores, proposal_log_scores)
 
         for divergence_type, _ in self.divergence_estimates_target_proposal.items():
-            self.divergence_estimates_model_base[divergence_type][context] += \
+            self.divergence_estimates_model_base[divergence_type].update(
                 divergence_pointwise_estimates_funcs[divergence_type](
-                    model_log_scores, base_log_scores, torch.as_tensor(1), proposal_log_scores)
+                    model_log_scores, base_log_scores, torch.as_tensor(1), proposal_log_scores))
 
-    def _report_and_reset_importance_sampling_estimate(self, estimates_dict, distributions_name):
+    def _report_importance_sampling_estimates(self, estimates_dict, distributions_name):
         """
         Reports all tracked metrics in the estimates_dict using
         as key name a concatentation of the metric name and the distributions_name
@@ -316,11 +317,25 @@ class Tuner():
             The dictionary tracking metric estimates for each context
         distributions_name: string
             A name that identifies the distributions of which we are tracking the metric
+        context: string
+            The specific context for which to report the estimate
         """
-        for metric_name, moving_averages in estimates_dict.items():
-            self.metric_updated.dispatch(f"{metric_name}_{distributions_name}",
-                    average(moving_averages))
-            estimates_dict[metric_name] = defaultdict(MovingAverage)
+        for metric_name, metric_estimates in estimates_dict.items():
+            if metric_estimates.value is not None:
+                self.metric_updated.dispatch(f"{metric_name}_{distributions_name}",
+                        metric_estimates.value)
+
+    def _report_all_importance_sampling_estimates(self, context):
+        """
+        Reports all tracked metrics for a given context
+        """
+        self._report_importance_sampling_estimates(self.divergence_estimates_target_model, 'target_model')
+        self._report_importance_sampling_estimates(self.divergence_estimates_target_proposal, 'target_proposal')
+        if self.track_divergence_from_base:
+            self._report_importance_sampling_estimates(self.divergence_estimates_model_base, 'model_base')
+            self._report_importance_sampling_estimates(self.divergence_estimates_proposal_base, 'proposal_base')
+        self._report_importance_sampling_estimates(self.features_moments_proposal, 'proposal')
+        self._report_importance_sampling_estimates(self.features_moments_target, 'target')
 
     def _update_proposal_if_better(self):
         """
@@ -357,11 +372,13 @@ class Tuner():
         n_steps: int
             number of accumulation steps
         """
-        proposal_log_scores, target_log_scores, model_log_scores, z_value = to_same_device(
-                proposal_log_scores, target_log_scores, model_log_scores, self.z[context].value)
+        proposal_log_scores, target_log_scores, model_log_scores = to_same_device(
+                proposal_log_scores, target_log_scores, model_log_scores)
+        z_value = self.z[context].value
 
         if z_value > 0:
-            loss = self._loss(samples, context, proposal_log_scores, target_log_scores, model_log_scores, z_value) / n_steps
+            z = torch.tensor(z_value, device=model_log_scores.device, dtype=model_log_scores.dtype)
+            loss = self._loss(samples, context, proposal_log_scores, target_log_scores, model_log_scores, z) / n_steps
             self.metric_updated.dispatch('loss', loss.item())
             loss.backward()
 
@@ -412,6 +429,8 @@ class Tuner():
                     mb_samples, mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores,
                     context, n_steps * self.params["n_contexts_per_step"])
 
+            self._report_all_importance_sampling_estimates(context)
+
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
@@ -442,13 +461,6 @@ class Tuner():
                 self.step_idx_updated.dispatch(s)
                 self._step()
 
-                if  0 == (s + 1) % self.params["divergence_evaluation_interval"]:
+                if  0 == (s + 1) % self.params["proposal_update_interval"]:
                     if "offline" == self.learning:
                         self._update_proposal_if_better()
-                    self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_target_model, 'target_model')
-                    self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_target_proposal, 'target_proposal')
-                    if self.track_divergence_from_base:
-                        self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_model_base, 'model_base')
-                        self._report_and_reset_importance_sampling_estimate(self.divergence_estimates_proposal_base, 'proposal_base')
-                    self._report_and_reset_importance_sampling_estimate(self.features_moments_proposal, 'proposal')
-                    self._report_and_reset_importance_sampling_estimate(self.features_moments_target, 'target')

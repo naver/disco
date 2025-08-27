@@ -5,9 +5,9 @@
 import torch
 from .f_divergence import FDivergenceLoss
 
-class ReverseKLLoss(FDivergenceLoss):
+class ReverseChiSquaredLoss(FDivergenceLoss):
     """
-    Kullback-Leibler divergence loss for DPG
+    Reverse Chi Squared divergence χ²(π || p) loss for DPG
     """
     def __init__(self, use_baseline=True, baseline_window_size=1024):
         """
@@ -16,13 +16,18 @@ class ReverseKLLoss(FDivergenceLoss):
         use_baseline: boolean
             use a baseline to reduce variance
         """
-        super(ReverseKLLoss, self).__init__(use_baseline, baseline_window_size)
+        super(ReverseChiSquaredLoss, self).__init__(use_baseline, baseline_window_size)
 
     def f_prime(self, log_t):
         """
+        Computes the f' term for the reverse (Neyman) chi-square divergence.
+
+        It corresponds to the generator f(u) = (u-1)^2 / u,
+        whose derivative is f'(u) = 1 - 1/u^2.
+
         Parameters
         ----------
         log_t: 0-dim Tensor
-            The log ratio of the policy and the normalized target distribution
+            The log ratio of the policy and the normalized target distribution, log(p/q).
         """
-        return log_t + 1
+        return 1.0 - torch.exp(-2 * log_t)

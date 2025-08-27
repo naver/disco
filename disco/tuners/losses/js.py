@@ -2,64 +2,28 @@
 # Copyright (C) 2022-present NAVER Corp.
 # Creative Commons Attribution-NonCommercial-ShareAlike 4.0 license
 
-from .base import BaseLoss
+from .f_divergence import FDivergenceLoss
 import torch
-from .misc.ema_baseline import EMABaseline
 
-LOG_2 = torch.log(torch.tensor(2))
-
-class JSLoss(BaseLoss):
+class JSLoss(FDivergenceLoss):
     """
     Jensen-Shannon divergence loss for DPG
     """
-    def __init__(self, use_baseline=False, ema_weight=0.99):
+    def __init__(self, use_baseline=True, baseline_window_size=1024):
         """
         Parameters
         ----------
-        baseline: boolean
+        use_baseline: boolean
             use a baseline to reduce variance
-        ema_weight: float
-            weight to compute the exponential moving average of the rewards
         """
-        super(JSLoss, self).__init__()
-        self.use_baseline = use_baseline
-        if use_baseline:
-            self.baseline = EMABaseline(ema_weight)
+        super(JSLoss, self).__init__(use_baseline, baseline_window_size)
 
-    def __call__(self, samples, context, scores, ebm_scores, model_scores, z):
+    def f_prime(self, log_t):
         """
-        Computes the JS "loss" on a given minibatch of samples
-
         Parameters
         ----------
-        samples: list of items
-            samples from the proposal model
-        context: text
-            context for the samples
-        scores: array of floats
-            logprobabilities for the samples according to the proposal
-        ebm_scores: array of floats
-            logscores for the samples according to the ebm
-        model_scores: array of floats
-            logprobabilities for the samples according to the model
-        z: float
-            estimation of the partition function of the EBM
- 
-        Returns
-        -------
-        mean loss across the minibatch
+        log_t: 0-dim Tensor
+            The log ratio of the policy and the normalized target distribution
         """
-
-        importance_ratios = torch.exp(model_scores.detach() - scores)
-        normalized_ebm_scores = ebm_scores - z.log()
-        rewards = importance_ratios * (-torch.log1p((normalized_ebm_scores - model_scores.detach()).exp()) + LOG_2)
-        self.metric_updated.dispatch('importance_ratios', importance_ratios.mean())
-        self.metric_updated.dispatch('rewards', rewards.mean())
-        if self.use_baseline:
-            advantage = self.baseline.advantage(rewards)
-            loss = torch.mean(advantage * model_scores)
-            self.metric_updated.dispatch('advantage', advantage.mean())
-        else:
-            loss = torch.mean(rewards * model_scores)
-
-        return loss
+        log_2 = torch.log(torch.tensor(2.0, dtype=log_t.dtype, device=log_t.device))
+        return log_2 - torch.nn.functional.softplus(-log_t)

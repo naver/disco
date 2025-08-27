@@ -5,9 +5,9 @@
 import torch
 from .f_divergence import FDivergenceLoss
 
-class ReverseKLLoss(FDivergenceLoss):
+class ChiSquaredLoss(FDivergenceLoss):
     """
-    Kullback-Leibler divergence loss for DPG
+    Chi squared divergence χ²(p || π) loss for DPG
     """
     def __init__(self, use_baseline=True, baseline_window_size=1024):
         """
@@ -16,7 +16,7 @@ class ReverseKLLoss(FDivergenceLoss):
         use_baseline: boolean
             use a baseline to reduce variance
         """
-        super(ReverseKLLoss, self).__init__(use_baseline, baseline_window_size)
+        super(ChiSquaredLoss, self).__init__(use_baseline, baseline_window_size)
 
     def f_prime(self, log_t):
         """
@@ -25,4 +25,4 @@ class ReverseKLLoss(FDivergenceLoss):
         log_t: 0-dim Tensor
             The log ratio of the policy and the normalized target distribution
         """
-        return log_t + 1
+        return torch.exp(log_t) - 1

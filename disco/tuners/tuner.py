@@ -392,15 +392,22 @@ class Tuner():
           - applies the accumulated gradients
 
         """
-        sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
-        n_steps = self.params["n_samples_per_context"] // self.params["scoring_size"]
-        contexts = self._get_next_context_batch()
+        # counters for statistics
+        n_samples_to_boost, n_samples_to_downweight = 0, 0
 
+        # iterate over n_contexts_per_step contexts
+        contexts = self._get_next_context_batch()
         for context in tqdm(contexts, desc="contexts", leave=False):
 
+            # obtain samples conditioned on this context
+            sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
             samples, proposal_log_scores = sampler.sample(sampling_size=self.params["sampling_size"], context=context)
-            target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)
 
+            # score the samples according to the target distribution
+            target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)
+            proposal_log_scores = batchify(self.proposal.log_score, self.params["scoring_size"], samples=samples, context=context)
+
+            # update importance sampling statistics
             self._update_moving_z(proposal_log_scores, target_log_scores, context)
             self._update_divergence_estimates_target_proposal(proposal_log_scores, target_log_scores, context)
             if self.track_divergence_from_base:
@@ -408,6 +415,8 @@ class Tuner():
                 base_log_scores = batchify(base.log_score, self.params["scoring_size" ], samples=samples, context=context)
                 self._update_divergence_estimates_proposal_base(proposal_log_scores, base_log_scores, context)
 
+            # peform n_steps forward/backward passes to accumulate gradients
+            n_steps = self.params["n_samples_per_context"] // self.params["scoring_size"]
             for s in trange(n_steps, desc="mini-steps", leave=False):
                 self.ministep_idx_updated.dispatch(s)
                 minibatch_slice = slice(s * self.params["scoring_size"], (s + 1) * self.params["scoring_size"])
@@ -417,19 +426,29 @@ class Tuner():
                 mb_target_log_scores = target_log_scores[minibatch_slice]
                 mb_model_log_scores = self.model.log_score(mb_samples, context=context, grad=True)
 
+                # also report policy dependent scores
                 self._update_divergence_estimates_target_model(
-                        mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores, context)
+                        mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores.detach(), context)
                 if self.track_divergence_from_base:
                     mb_base_log_scores = base_log_scores[minibatch_slice]
-                    self._update_divergence_estimates_model_base(mb_proposal_log_scores, mb_model_log_scores, mb_base_log_scores, context)
+                    self._update_divergence_estimates_model_base(mb_proposal_log_scores, mb_model_log_scores.detach(), mb_base_log_scores, context)
                 self.eval_samples_updated.dispatch(
-                        context, mb_samples, mb_proposal_log_scores, mb_model_log_scores, mb_target_log_scores)
+                        context, mb_samples, mb_proposal_log_scores, mb_model_log_scores.detach(), mb_target_log_scores)
 
                 self._compute_gradient(
                     mb_samples, mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores,
                     context, n_steps * self.params["n_contexts_per_step"])
 
+                mb_in_support = ~mb_target_log_scores.isneginf()
+                mb_in_support_target_norm_log_scores = mb_target_log_scores[mb_in_support] - \
+                    torch.log(torch.tensor(self.z[context].value, device=mb_target_log_scores.device))
+                n_samples_to_boost += (mb_in_support_target_norm_log_scores > mb_model_log_scores[mb_in_support]).sum().item()
+                n_samples_to_downweight += (mb_in_support_target_norm_log_scores < mb_model_log_scores[mb_in_support]).sum().item()
+
             self._report_all_importance_sampling_estimates(context)
+
+        self.metric_updated.dispatch("n_samples_to_boost", n_samples_to_boost)
+        self.metric_updated.dispatch("n_samples_to_downweight", n_samples_to_downweight)
 
         self.optimizer.step()
         self.scheduler.step()

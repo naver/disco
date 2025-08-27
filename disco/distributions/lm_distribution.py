@@ -5,7 +5,7 @@
 import torch
 import copy
 import time
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, LogitsProcessorList
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, LogitsProcessorList, GenerationConfig
 
 from collections import namedtuple
 
@@ -63,19 +63,14 @@ class LMDistribution(BaseDistribution):
 
         self.length = length
 
-        default_params = {
+        self.gen_config = GenerationConfig(**{
             "top_k": 0,
             "top_p": 1.0,
             "typical_p": 1.0,
             "temperature": 1.0,
             "num_beams": 1
-        }
-        self.params = default_params.copy()
-        self.params.update(config)
-
-        self.scorable = True if all(\
-                [default_params[k] == self.params[k] for k in default_params.keys()]\
-            ) else False
+        })
+        self.gen_config.update(**config)
 
     def _load_network(self, auto, model, device):
         print(f"Loading model to {device}")
@@ -121,7 +116,6 @@ class LMDistribution(BaseDistribution):
         -------
         tensor of log-probabilities
         """
-        assert self.scorable, "this distribution's parameters make it unscorable."
         shapes = set([s.token_ids.shape for s in samples])
         assert 1 == len(shapes), f"sequences of token_ids should have the same shape, but got: {shapes}."
 
@@ -214,10 +208,7 @@ class LMDistribution(BaseDistribution):
 
 
     def _process_and_warp_logits(self, all_logits, input_ids, encoder_input_ids):
-        generation_config = copy.deepcopy(self.network.generation_config)
-        generation_config.update(**self.params)
-
-        generation_config, model_kwargs = self.network._prepare_generation_config(generation_config)
+        generation_config = copy.deepcopy(self.gen_config)
         self.network._prepare_special_tokens(generation_config, False, self.network.device)
 
         logits_processor = self.network._get_logits_processor(
@@ -228,8 +219,12 @@ class LMDistribution(BaseDistribution):
             logits_processor=LogitsProcessorList()
         )
 
-        for i in range(all_logits.shape[1]): # [n_samples, length, vocab]
-            all_logits[:,i,:] = logits_processor(input_ids[:,:i+1], all_logits[:,i,:])
+        processed_logits = []
+        for i in range(all_logits.size(1)):
+            processed = logits_processor(input_ids[:, :i+1], all_logits[:, i, :])
+            processed_logits.append(processed.unsqueeze(1))
+
+        all_logits = torch.cat(processed_logits, dim=1)
 
         return all_logits
 
@@ -254,10 +249,15 @@ class LMDistribution(BaseDistribution):
         elif not context:
             context = self.tokenizer.bos_token
 
-        input_ids = self.tokenizer([context] * sampling_size, return_tensors="pt", add_special_tokens=True).input_ids.to(self.device)
-        n_context_tokens = input_ids.shape[-1]
+        tokenized_context = self.tokenizer(
+            context,
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=True
+        )
+        tokenized_contexts = {k: v.to(self.network.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}        # Check what you get
 
-        generate_kwargs = dict(self.params)
+        n_context_tokens = tokenized_contexts["input_ids"].shape[-1]
 
         # encoder-decoder models have a hard-coded prompt with the context used for the encoder
         # In contrast, decoder-only models use the context as a prompt.
@@ -273,10 +273,10 @@ class LMDistribution(BaseDistribution):
             prompt_length = n_context_tokens
             last = None
 
-        outputs = self.network.generate(input_ids,
+        outputs = self.network.generate(**tokenized_contexts,
             output_scores=True, return_dict_in_generate=True,
             max_new_tokens=self.length,
-            do_sample=True, **generate_kwargs)
+            do_sample=True, generation_config=self.gen_config)
 
         all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)  # [sampling_size, length, vocab]
         token_seq_logprobs = torch.gather(

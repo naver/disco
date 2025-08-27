@@ -25,7 +25,8 @@ class ConsoleLogger(BaseTunerObserver):
     def on_eval_samples_updated(self, context, samples, proposal_log_scores, model_log_scores, target_log_scores):
         tqdm.write(f"Context: {context}")
         tqdm.write("Samples:")
-        tqdm.write("\n".join(s.text for s in samples[:3]))
+        n = 3
+        tqdm.write("\n".join(s.text + f"\ntarget: {t.item()} - proposal: {p.item()} - model: {m.item()}" for (s, p, m, t) in zip(samples[:n], proposal_log_scores[:n], model_log_scores[:n], target_log_scores[:n])))
 
     def on_step_idx_updated(self, s):
         self.step = s

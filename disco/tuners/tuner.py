@@ -396,7 +396,7 @@ class Tuner():
         n_steps = self.params["n_samples_per_context"] // self.params["scoring_size"]
         contexts = self._get_next_context_batch()
 
-        for context in tqdm(contexts, desc="Contexts", leave=False):
+        for context in tqdm(contexts, desc="contexts", leave=False):
 
             samples, proposal_log_scores = sampler.sample(sampling_size=self.params["sampling_size"], context=context)
             target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)
@@ -408,7 +408,7 @@ class Tuner():
                 base_log_scores = batchify(base.log_score, self.params["scoring_size" ], samples=samples, context=context)
                 self._update_divergence_estimates_proposal_base(proposal_log_scores, base_log_scores, context)
 
-            for s in range(n_steps):
+            for s in trange(n_steps, desc="mini-steps", leave=False):
                 self.ministep_idx_updated.dispatch(s)
                 minibatch_slice = slice(s * self.params["scoring_size"], (s + 1) * self.params["scoring_size"])
 

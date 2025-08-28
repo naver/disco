@@ -61,10 +61,12 @@ class Tuner():
         "n_contexts_per_step": 2**4, # number of different contexts to sample per gradient step
         "proposal_update_interval": 2**4, # number of gradient steps every which to update the proposal in offline learning
         "proposal_update_metric": "kl", # the proposal will be updated if the model is better according to this metric
-        "estimates_rolling_window_size": 2**8 # number of samples to accumulate in a rollowing window estimate
+        "estimates_rolling_window_size": 2**8, # number of samples to accumulate in a rollowing window estimate
+        "validation_interval": 2**4, # number of steps every which to compute feature moments on the validation contexts
+        "validate_on_start": True,
     }
 
-    def __init__(self, model, target, proposal=None, context_dataset=None, loss=JSLoss(), features=[],
+    def __init__(self, model, target, proposal=None, context_dataset=None, val_dataset=None, loss=JSLoss(), features=[],
             track_metrics=["kl", "tv", "js"], track_divergence_from_base=False, **params):
         """
         Parameters
@@ -104,9 +106,10 @@ class Tuner():
             self.learning = "online"
         self.model = model
 
-        self.context_dataloader = torch.utils.data.DataLoader(context_dataset, batch_size=self.params["n_contexts_per_step"], shuffle=True, collate_fn=lambda x: x)
+        self.context_dataloader = torch.utils.data.DataLoader(context_dataset, batch_size=self.params["n_contexts_per_step"], shuffle=False, collate_fn=lambda x: x)
         self.context_iterator = iter(self.context_dataloader)
 
+        self.val_dataset = val_dataset
 
         self._loss = loss
 
@@ -162,10 +165,10 @@ class Tuner():
                 self.divergence_estimates_model_base[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
 
         self.features_moments_proposal = dict()
-        self.features_moments_target = dict()
+        self.features_moments_model = dict()
         for (label, feature) in self.features:
             self.features_moments_proposal[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
-            self.features_moments_target[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+            self.features_moments_model[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
         if self.features:
             self.eval_samples_updated.enroll(self._update_features_moments)
 
@@ -194,7 +197,7 @@ class Tuner():
         for (label, feature) in self.features:
             proposal_moment_pointwise_estimates = feature.log_score(samples, context=context).exp().to(device)
             self.features_moments_proposal[label].update(proposal_moment_pointwise_estimates)
-            self.features_moments_target[label].update(importance_ratios * proposal_moment_pointwise_estimates)
+            self.features_moments_model[label].update(importance_ratios * proposal_moment_pointwise_estimates)
 
     def _update_moving_z(self, proposal_log_scores, target_log_scores, context):
         """
@@ -336,7 +339,7 @@ class Tuner():
             self._report_importance_sampling_estimates(self.divergence_estimates_model_base, 'model_base')
             self._report_importance_sampling_estimates(self.divergence_estimates_proposal_base, 'proposal_base')
         self._report_importance_sampling_estimates(self.features_moments_proposal, 'proposal')
-        self._report_importance_sampling_estimates(self.features_moments_target, 'target')
+        self._report_importance_sampling_estimates(self.features_moments_model, 'model')
 
     def _update_proposal_if_better(self):
         """
@@ -484,6 +487,13 @@ class Tuner():
         with trange(self.params["n_gradient_steps"], desc='fine-tuning', position=0) as t:
             for s in t:
                 self.step_idx_updated.dispatch(s)
+
+                if self.val_dataset and 0 == s % self.params["validation_interval"] and \
+                    (s > 0 or self.params["validate_on_start"]):
+                    with Timer() as val_t:
+                        self._report_features_on_validation_contexts()
+                    self.metric_updated.dispatch("timing/validation", val_t.elapsed)
+
                 with Timer() as step_t:
                     self._step()
                 self.metric_updated.dispatch("timing/step", step_t.elapsed)
@@ -491,3 +501,21 @@ class Tuner():
                 if  0 == (s + 1) % self.params["proposal_update_interval"]:
                     if "offline" == self.learning:
                         self._update_proposal_if_better()
+
+    def _report_features_on_validation_contexts(self):
+        """
+            Compute features moments on contexts extracted from the validation set
+        """
+        val_dataloader = torch.utils.data.DataLoader(self.val_dataset, batch_size=self.params["sampling_size"], shuffle=False, collate_fn=lambda x: x)
+        val_model = self.model.validation()
+        features_moments = dict()
+        for (label, feature) in self.features:
+            features_moments[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+        for val_contexts in tqdm(val_dataloader, desc="validation", leave=False):
+            samples, _ = val_model.sample_batch(val_contexts, sampling_size=1)
+            for (label, feature) in self.features:
+                for sample, context in zip(samples, val_contexts):
+                    proposal_moment_pointwise_estimate = feature.log_score([sample], context=context).exp()
+                    features_moments[label].update(proposal_moment_pointwise_estimate)
+        for (label, _) in self.features:
+            self.metric_updated.dispatch(f"val_{label}", features_moments[label].value)

@@ -3,15 +3,20 @@
 # Creative Commons Attribution-NonCommercial-ShareAlike 4.0 license
 
 import torch
+import torch.nn.functional as F
 import copy
 import time
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, LogitsProcessorList, GenerationConfig
+from transformers.generation.logits_process import (
+    LogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
+    NoRepeatNGramLogitsProcessor,
+)
 
 from collections import namedtuple
 
 from .base_distribution import BaseDistribution
 from disco.utils.helpers import get_token_first_indices
-
 
 TextSample = namedtuple('TextSample', ['token_ids', 'text'])
 
@@ -128,120 +133,175 @@ class LMDistribution(BaseDistribution):
         return TextSample(token_ids=token_ids, text=text)
 
     def log_score(self, samples, context="", grad=False, sum=True):
-        """Computes log-probabilities for the samples according
-        to the language model network in the given context
-
-        Parameters
-        ----------
-        samples: list(Sample)
-            samples to (log-)score as a list()
-        context: text
-            context for which to (log-)score the samples
-        grad: boolean
-            flag to eventually compute the gradients, e.g. when fitting
-        sum: boolean
-            flag to eventually return token-level tensor of scores
-
-        Returns
-        -------
-        tensor of log-probabilities
         """
-        shapes = set([s.token_ids.shape for s in samples])
-        assert 1 == len(shapes), f"sequences of token_ids should have the same shape, but got: {shapes}."
+        Computes log-probabilities for samples using a memory-efficient
+        cross_entropy calculation with the CORRECT order of operations.
+        """
+        shapes = {s.token_ids.shape for s in samples}
+        assert len(shapes) == 1, "All sequences of token_ids must have the same shape."
 
+        # --- 1. PREPARE TOKENS ---
         if self.network.config.is_encoder_decoder:
-            assert context is not None and context != "", "context (encoder input) is mandatory for encoder-decoder models"
+            assert context, "Context is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
 
-        tokenized_context = self.tokenizer([context] * len(samples), return_tensors="pt", add_special_tokens=True)
-        tokenized_context["input_ids"] = tokenized_context["input_ids"].to(self.device)
-        tokenized_context["attention_mask"] = tokenized_context["attention_mask"].to(self.device)
+        tokenized_context = self.tokenizer([context] * len(samples), return_tensors="pt", add_special_tokens=True, padding=True)
+        tokenized_context = {k: v.to(self.device) for k, v in tokenized_context.items()}
 
-        tokenized_samples = dict()
-        tokenized_samples["input_ids"] = torch.stack([sample.token_ids for sample in samples]).to(self.device)
+        tokenized_samples = {"input_ids": torch.stack([s.token_ids for s in samples]).to(self.device)}
 
+        # --- 2. CREATE SAMPLE MASK ---
+        # This adds the 'attention_mask' key to tokenized_samples.
         tokenized_samples = self._discount_padding_tokens(tokenized_samples)
 
-        input_ids, encoder_input_ids, forward_kwargs, labels, prompt_length, last  = \
-                self._get_forward_inputs(tokenized_context, tokenized_samples, samples)
+        # --- 3. PREPARE ALL MODEL INPUTS AND LABELS ---
+        _, _, forward_kwargs, labels, prompt_length, _ = self._get_forward_inputs(
+            tokenized_context, tokenized_samples, samples
+        )
 
-        if grad:
-            outputs = self.network(**forward_kwargs, labels=labels)
-        else:
-            with torch.no_grad():
-                outputs = self.network(**forward_kwargs, labels=labels)
+        # --- 4. RUN FORWARD PASS ---
+        with torch.set_grad_enabled(grad):
+            outputs = self.network(**forward_kwargs)
 
-        all_logits = outputs.logits[:, prompt_length:last, :] # [n_samples, length, vocab]
+        logits = outputs.logits
 
-        all_logits = self._process_and_warp_logits(all_logits, input_ids, encoder_input_ids)
+        # --- 5. CALCULATE LOG PROBABILITIES ---
+        # The labels tensor is already correctly formatted with -100 for ignored tokens.
 
-        all_logprobs = all_logits.log_softmax(-1)
+        # Shift logits and labels for proper alignment
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
 
-        seq_logprobs = torch.gather(
-                all_logprobs, 2, tokenized_samples["input_ids"][:, :, None]
-            ).squeeze(-1) # [n_samples, length]
+        # Reshape for cross_entropy
+        batch_size, seq_len, vocab_size = shift_logits.shape
+        logits_for_loss = shift_logits.view(batch_size * seq_len, vocab_size)
+        labels_for_loss = shift_labels.view(batch_size * seq_len)
 
-        seq_logprobs = torch.where(1 == tokenized_samples["attention_mask"], seq_logprobs, torch.tensor(0.).to(self.device))
+        # Calculate negative log-probabilities
+        # F.cross_entropy will handle the ignore_index=-100 from the labels tensor.
+        token_neg_logprobs = F.cross_entropy(
+            logits_for_loss,
+            labels_for_loss,
+            reduction='none',
+            ignore_index=-100
+        )
+
+        # Reshape back and negate to get log-probabilities
+        seq_logprobs = -token_neg_logprobs.view(batch_size, seq_len)
 
         return seq_logprobs.sum(dim=1) if sum else seq_logprobs
 
     def _discount_padding_tokens(self, tokenized_samples):
-        first_eos_indices = get_token_first_indices(
-                tokenized_samples["input_ids"],
-                self.tokenizer.eos_token_id
-            )
-        tokenized_samples["attention_mask"] = torch.where(
-                self.tokenizer.pad_token_id == tokenized_samples["input_ids"],
-                0, 1
-            )
-        for i, ix in enumerate(first_eos_indices):
-            if None != self.network.config.forced_bos_token_id and\
-                self.network.config.forced_bos_token_id == tokenized_samples["input_ids"][i][0]:
-                    tokenized_samples["attention_mask"][i][0] = 0
-            else:
-                tokenized_samples["attention_mask"][i][0] = 1  # at least score one token
-            if ix != -1:  # if there is an pad token
-                tokenized_samples["attention_mask"][i][ix] = 1  # score first pad token
-                tokenized_samples["attention_mask"][i][ix + 1:] = 0  # ignore everything after it
-        tokenized_samples["attention_mask"] = tokenized_samples["attention_mask"].to(self.device)
+        """
+        Creates an attention mask that ignores padding, post-EOS tokens, and an optional forced BOS token.
+        """
+        input_ids = tokenized_samples["input_ids"]
+        device = input_ids.device
+
+        # 1. Create a base mask that ignores padding tokens. This is already vectorized.
+        pad_mask = (input_ids != self.tokenizer.pad_token_id)
+
+        # 2. Create a mask to ignore tokens after the first EOS token.
+        # This replaces the main `for` loop.
+        is_eos = (input_ids == self.tokenizer.eos_token_id)
+        # The cumulative sum will be 0 before the first EOS, 1 at the first EOS, and >1 after.
+        # By keeping everything <= 1, we keep all tokens up to and including the first EOS.
+        eos_mask = is_eos.cumsum(dim=1) <= 1
+
+        # 3. Combine the masks. A token is attended to if it's not a pad AND it's not after the first EOS.
+        attention_mask = pad_mask & eos_mask
+
+        # 4. Vectorized handling of a forced BOS token, if applicable.
+        # This prevents scoring the model on predicting the BOS token it was given.
+        forced_bos_token_id = getattr(self.network.config, "forced_bos_token_id", None)
+        if forced_bos_token_id is not None:
+            # Create a mask that is True only for the first token if it's a forced BOS
+            is_forced_bos_at_start = (input_ids[:, 0] == forced_bos_token_id)
+            # Set the attention mask at the first position to 0 where the condition is True
+            attention_mask[:, 0] = torch.where(is_forced_bos_at_start, False, attention_mask[:, 0])
+
+        tokenized_samples["attention_mask"] = attention_mask.to(torch.int) # Convert boolean to int
         return tokenized_samples
 
-
     def _get_forward_inputs(self, tokenized_context, tokenized_samples, samples):
+        """
+        Prepares model inputs and labels correctly and efficiently.
+        This version includes an explicit check for the sample attention mask
+        and clarifies label creation.
+        """
+        assert "attention_mask" in tokenized_samples, \
+            "_get_forward_inputs requires 'attention_mask' in tokenized_samples. " \
+            "Please call _discount_padding_tokens first."
+
         if self.network.config.is_encoder_decoder:
-            prompt_length = None
-            last = -1
-            encoder_input_ids = tokenized_context["input_ids"]
-            input_ids = tokenized_samples["input_ids"]
+            encoder_inputs = tokenized_context
+            decoder_inputs = tokenized_samples["input_ids"]
+
             forward_kwargs = {
-                "input_ids": encoder_input_ids,
-                "decoder_input_ids": input_ids,
+                "input_ids": encoder_inputs["input_ids"],
+                "attention_mask": encoder_inputs["attention_mask"],
+                "decoder_input_ids": decoder_inputs,
             }
-            input_ids, forward_kwargs = self.network._prepare_decoder_input_ids_for_generation(len(samples),
-                "decoder_input_ids",
-                forward_kwargs)
-            forward_kwargs['decoder_input_ids'] = input_ids
-            labels = forward_kwargs["decoder_input_ids"]
-        else:
-            prompt_length = tokenized_context["input_ids"].shape[-1] - 1
-            last = -1
-            encoder_input_ids = None
-            input_ids = torch.cat((tokenized_context["input_ids"], tokenized_samples["input_ids"]), 1)
+
+            # Create labels and use the pre-computed sample mask to ignore padding/EOS.
+            labels = decoder_inputs.clone()
+            labels[tokenized_samples["attention_mask"] == 0] = -100
+
+            prompt_length, last = None, None
+            encoder_input_ids = encoder_inputs["input_ids"]
+            # The first returned value is ambiguous here, let's keep it for compatibility.
+            # It's better to rely on forward_kwargs.
+            input_ids = encoder_input_ids
+
+        else: # Decoder-only models (e.g., GPT-2, Llama)
+            context_ids = tokenized_context["input_ids"]
+            sample_ids = tokenized_samples["input_ids"]
+            input_ids = torch.cat((context_ids, sample_ids), dim=1)
+
+            context_mask = tokenized_context["attention_mask"]
+            sample_mask = tokenized_samples["attention_mask"]
+            attention_mask = torch.cat((context_mask, sample_mask), dim=1)
+
             forward_kwargs = {
                 "input_ids": input_ids,
-                "attention_mask": torch.cat((tokenized_context["attention_mask"], tokenized_samples["attention_mask"]), 1)
+                "attention_mask": attention_mask
             }
-            labels = forward_kwargs["input_ids"]
+
+            labels = input_ids.clone()
+            prompt_length = context_ids.shape[1]
+
+            # 1. Ignore the context part of the labels.
+            labels[:, :prompt_length] = -100
+
+            # 2. Ignore the padded/post-EOS part of the samples in the labels.
+            # We create a boolean mask for the sample part of the labels.
+            sample_part_in_labels_mask = torch.zeros_like(labels, dtype=torch.bool)
+            sample_part_in_labels_mask[:, prompt_length:] = True
+
+            # The sample_mask tells us which tokens in the sample are invalid.
+            # We combine these conditions: a label is ignored if it's in the sample part
+            # AND its corresponding sample_mask is 0.
+            labels[(sample_part_in_labels_mask) & (attention_mask == 0)] = -100
+
+            last, encoder_input_ids = None, None
 
         return input_ids, encoder_input_ids, forward_kwargs, labels, prompt_length, last
 
-
     def _process_and_warp_logits(self, all_logits, input_ids, encoder_input_ids):
+        """
+        Applies logits processors to the full logits tensor in a highly optimized way.
+
+        This version separates stateful and stateless processors. Stateless ones are applied
+        in a single vectorized operation, while the slow sequential loop is only used for
+        the few stateful ones that require it.
+        """
+        # 1. Get the full list of processors as before
         generation_config = copy.deepcopy(self.gen_config)
+        # The _prepare_special_tokens call is often unnecessary here, but we keep for compatibility
         self.network._prepare_special_tokens(generation_config, False, self.network.device)
 
-        logits_processor = self.network._get_logits_processor(
+        full_processor_list = self.network._get_logits_processor(
             generation_config=generation_config,
             input_ids_seq_length=input_ids.shape[-1],
             encoder_input_ids=encoder_input_ids,
@@ -249,33 +309,67 @@ class LMDistribution(BaseDistribution):
             logits_processor=LogitsProcessorList()
         )
 
-        processed_logits = []
-        for i in range(all_logits.size(1)):
-            processed = logits_processor(input_ids[:, :i+1], all_logits[:, i, :])
-            processed_logits.append(processed.unsqueeze(1))
+        if not full_processor_list:
+            return all_logits
 
-        all_logits = torch.cat(processed_logits, dim=1)
+        # 2. Separate processors into stateless and stateful lists
+        stateless_processors = LogitsProcessorList()
+        stateful_processors = LogitsProcessorList()
+
+        # Define which processor classes are stateful (require token history)
+        STATEFUL_PROCESSOR_CLASSES = (
+            RepetitionPenaltyLogitsProcessor,
+            NoRepeatNGramLogitsProcessor,
+        )
+
+        for processor in full_processor_list:
+            if isinstance(processor, STATEFUL_PROCESSOR_CLASSES):
+                stateful_processors.append(processor)
+            else:
+                stateless_processors.append(processor)
+
+        # 3. Apply all STATELESS processors in a single, vectorized call.
+        # Most processors (Temperature, TopK, TopP) are stateless and can operate
+        # on the entire [batch, seq_len, vocab_size] tensor at once.
+        if stateless_processors:
+            # Note: The `input_ids` argument is ignored by stateless processors.
+            all_logits = stateless_processors(None, all_logits)
+
+        # 4. Apply STATEFUL processors sequentially, ONLY if necessary.
+        # This is the original slow loop, but now it runs with a much smaller
+        # list of processors, or not at all if none are stateful.
+        if stateful_processors:
+            processed_logits = []
+            for i in range(all_logits.shape[1]):
+                # The input history is `input_ids[:, :i+1]`, and current logits are `all_logits[:, i, :]`
+                current_step_logits = all_logits[:, i, :]
+                history = input_ids[:, :i+1]
+                processed_step_logits = stateful_processors(history, current_step_logits)
+                processed_logits.append(processed_step_logits.unsqueeze(1))
+
+            all_logits = torch.cat(processed_logits, dim=1)
 
         return all_logits
 
     def sample(self, context="", sampling_size=32, sum=True):
-        """Samples sequences from the language model in the given context
+        """
+        Samples sequences from the language model in the given context
 
         Parameters
         ----------
-        context: text
-            contextual text for which to sample
+        context: str
+            Contextual text for which to sample.
         sampling_size: int
-            number of sequences to sample
-        sum: Boolean
-            flag to eventually return token-level tensor of scores
+            Number of sequences to sample.
+        sum: bool
+            Flag to return a token-level tensor of scores or sum them per sequence.
 
         Returns
         -------
-        tuple of (list of Sample(tokens, text), tensor of logprobs)
+        tuple of (list of TextSample(tokens, text), tensor of logprobs)
         """
         if self.network.config.is_encoder_decoder:
-            assert context is not None and context != "", "context (encoder input) is mandatory for encoder-decoder models"
+            assert context, "Context (encoder input) is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
 
@@ -285,63 +379,61 @@ class LMDistribution(BaseDistribution):
             return_tensors="pt",
             add_special_tokens=True
         )
-        tokenized_contexts = {k: v.to(self.network.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}        # Check what you get
+        # Replicate the context for batch generation
+        tokenized_contexts = {k: v.to(self.network.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}
 
-        n_context_tokens = tokenized_contexts["input_ids"].shape[-1]
+        prompt_length = tokenized_contexts["input_ids"].shape[1]
 
-        # encoder-decoder models have a hard-coded prompt with the context used for the encoder
-        # In contrast, decoder-only models use the context as a prompt.
-        if self.network.config.is_encoder_decoder:
-            prompt_length = 1
-            last = None
-            torch.tensor([self.tokenizer.bos_token_id] * sampling_size).unsqueeze(-1).to(self.device)
-            decoder_input_ids, generate_kwargs = self.network._prepare_decoder_input_ids_for_generation(sampling_size,
-                    "decoder_input_ids",
-                    generate_kwargs)
-            generate_kwargs["decoder_input_ids"] = decoder_input_ids
-        else:
-            prompt_length = n_context_tokens
-            last = None
-
-        outputs = self.network.generate(**tokenized_contexts,
-            output_scores=True, return_dict_in_generate=True,
+        # Generate sequences and scores in one go
+        outputs = self.network.generate(
+            **tokenized_contexts,
+            output_scores=True,
+            return_dict_in_generate=True,
             max_new_tokens=self.length,
-            do_sample=True, generation_config=self.gen_config)
+            do_sample=True,
+            generation_config=self.gen_config
+        )
 
-        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)  # [sampling_size, length, vocab]
-        token_seq_logprobs = torch.gather(
-                all_logprobs, 2, outputs.sequences[:, prompt_length:last][:, :, None]
-            ).squeeze(-1) # [sampling_size, length]
+        # Efficiently get logprobs for the generated tokens only
+        # Shape: [sampling_size, generated_length, vocab_size]
+        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)
 
-        # we need to zero the (log-)scores of extra <eos>
-        first_eos_indices = get_token_first_indices(
-                outputs.sequences[:, prompt_length:last],  # starting at 1 to skip an eventual bos token
-                self.tokenizer.eos_token_id
-            )
-        non_pad_tokens = torch.cat(
-                (outputs.sequences[:, prompt_length:last][:, 0].unsqueeze(1),
-                torch.where(
-                        self.tokenizer.pad_token_id == outputs.sequences[:, prompt_length:last][:, 1:],
-                        -1,
-                        outputs.sequences[:, prompt_length:last][:, 1:])
-                    ),
-                dim=1
-            )
-        non_pad_log_scores = torch.where(-1 != non_pad_tokens, token_seq_logprobs, torch.tensor(0.).to(self.device))
-        for i, ix in enumerate(first_eos_indices):
-            non_pad_log_scores[i][0] = token_seq_logprobs[i][0]  # at least score one token
-            if ix != -1: # if there an eos token
-                non_pad_log_scores[i][ix] = token_seq_logprobs[i][ix]  # keep the first eos scores
-                non_pad_log_scores[i][ix + 1:] = 0. # ignore everything after eos
+        # The actual generated tokens, excluding the prompt
+        generated_sequences = outputs.sequences[:, prompt_length:]
 
-        seq_logprobs = non_pad_log_scores.sum(dim=1) if sum else non_pad_log_scores
+        # Gather the logprobs of the specific tokens that were sampled
+        # Shape: [sampling_size, generated_length]
+        token_seq_logprobs = torch.gather(all_logprobs, 2, generated_sequences.unsqueeze(-1)).squeeze(-1)
 
-        output_tokens = outputs.sequences[:, prompt_length:] # [sampling_size, length]
+        # Create a mask to zero out logprobs for tokens after the first EOS token.
+        # This entire block replaces the slow Python `for` loop.
+        eos_token_id = self.tokenizer.eos_token_id
+        is_eos = (generated_sequences == eos_token_id)
 
-        return (
-                [TextSample(ots, self.tokenizer.decode(ots)) for ots in output_tokens],
-                seq_logprobs
-            )
+        # Find the index of the first EOS in each sequence
+        # cumsum will be 0 before the first True, 1 at the first True, and >1 after.
+        eos_mask = is_eos.cumsum(dim=1) <= 1
+
+        # Also create a mask for padding tokens, if any
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is not None:
+            pad_mask = (generated_sequences != pad_token_id)
+            final_mask = eos_mask & pad_mask
+        else:
+            final_mask = eos_mask
+
+        # Apply the combined mask to zero out irrelevant scores
+        final_logprobs = token_seq_logprobs.where(final_mask, 0.0)
+
+        seq_logprobs = final_logprobs.sum(dim=1) if sum else final_logprobs
+
+        # Decode all sequences in a single, optimized call
+        decoded_texts = self.tokenizer.batch_decode(generated_sequences, skip_special_tokens=True)
+
+        # Create the final list of samples
+        samples = [TextSample(tokens, text) for tokens, text in zip(generated_sequences, decoded_texts)]
+
+        return (samples, seq_logprobs)
 
     def sample_batch(self, contexts, sampling_size=32, sum=True):
         """

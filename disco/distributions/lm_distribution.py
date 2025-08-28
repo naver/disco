@@ -132,6 +132,211 @@ class LMDistribution(BaseDistribution):
 
         return TextSample(token_ids=token_ids, text=text)
 
+    def sample(self, context="", sampling_size=32, sum=True):
+        """
+        Samples sequences from the language model in the given context
+
+        Parameters
+        ----------
+        context: str
+            Contextual text for which to sample.
+        sampling_size: int
+            Number of sequences to sample.
+        sum: bool
+            Flag to return a token-level tensor of scores or sum them per sequence.
+
+        Returns
+        -------
+        tuple of (list of TextSample(tokens, text), tensor of logprobs)
+        """
+        if self.network.config.is_encoder_decoder:
+            assert context, "Context (encoder input) is mandatory for encoder-decoder models."
+        elif not context:
+            context = self.tokenizer.bos_token
+
+        tokenized_context = self.tokenizer(
+            context,
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=True
+        )
+        # Replicate the context for batch generation
+        tokenized_contexts = {k: v.to(self.network.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}
+
+        prompt_length = tokenized_contexts["input_ids"].shape[1]
+
+        # Generate sequences and scores in one go
+        outputs = self.network.generate(
+            **tokenized_contexts,
+            output_scores=True,
+            return_dict_in_generate=True,
+            max_new_tokens=self.length,
+            do_sample=True,
+            generation_config=self.gen_config
+        )
+
+        # Efficiently get logprobs for the generated tokens only
+        # Shape: [sampling_size, generated_length, vocab_size]
+        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)
+
+        # The actual generated tokens, excluding the prompt
+        generated_sequences = outputs.sequences[:, prompt_length:]
+
+        # Gather the logprobs of the specific tokens that were sampled
+        # Shape: [sampling_size, generated_length]
+        token_seq_logprobs = torch.gather(all_logprobs, 2, generated_sequences.unsqueeze(-1)).squeeze(-1)
+
+        # Create a mask to zero out logprobs for tokens after the first EOS token.
+        # This entire block replaces the slow Python `for` loop.
+        eos_token_id = self.tokenizer.eos_token_id
+        is_eos = (generated_sequences == eos_token_id)
+
+        # Find the index of the first EOS in each sequence
+        # cumsum will be 0 before the first True, 1 at the first True, and >1 after.
+        eos_mask = is_eos.cumsum(dim=1) <= 1
+
+        # Also create a mask for padding tokens, if any
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is not None:
+            pad_mask = (generated_sequences != pad_token_id)
+            final_mask = eos_mask & pad_mask
+        else:
+            final_mask = eos_mask
+
+        # Apply the combined mask to zero out irrelevant scores
+        final_logprobs = token_seq_logprobs.where(final_mask, 0.0)
+
+        seq_logprobs = final_logprobs.sum(dim=1) if sum else final_logprobs
+
+        # Decode all sequences in a single, optimized call
+        decoded_texts = self.tokenizer.batch_decode(generated_sequences, skip_special_tokens=True)
+
+        # Create the final list of samples
+        samples = [TextSample(tokens, text) for tokens, text in zip(generated_sequences, decoded_texts)]
+
+        return (samples, seq_logprobs)
+
+    def sample_batch(self, contexts, sampling_size=32, sum=True):
+        """
+        Generates samples for a batch of contexts.
+
+        This method processes multiple input contexts simultaneously, generating
+        a specified number of samples for each. It leverages batching to
+        efficiently perform generation on a GPU.
+
+        Parameters
+        ----------
+        contexts: list of str
+            A list of contextual text strings for which to sample.
+        sampling_size: int
+            The number of sequences to sample for each context in the list.
+        sum: bool
+            If True, returns the sum of log probabilities for each sequence.
+            If False, returns a tensor of token-level log probabilities.
+
+        Returns
+        -------
+        tuple of (list of lists of TextSample, torch.Tensor)
+            - A list of lists, where the outer list corresponds to the input
+              contexts and each inner list contains `sampling_size` TextSample
+              objects.
+            - A tensor containing the log probabilities of the generated
+              sequences, with shape `(num_contexts, sampling_size)` if `sum` is
+              True, or `(num_contexts, sampling_size, sequence_length)` if
+              `sum` is False.
+        """
+        if not isinstance(contexts, list) or not contexts:
+            raise ValueError("contexts must be a non-empty list of strings.")
+
+        # Tokenize the entire batch of contexts with padding
+        tokenized_contexts = self.tokenizer(
+            contexts,
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=True
+        ).to(self.device)
+
+        num_contexts = len(contexts)
+        total_batch_size = num_contexts * sampling_size
+
+        # Repeat the tokenized inputs to create a batch of size
+        # (num_contexts * sampling_size) where each context is repeated
+        # `sampling_size` times.
+        batch = {
+            "input_ids": tokenized_contexts["input_ids"].repeat_interleave(sampling_size, dim=0),
+            "attention_mask": tokenized_contexts["attention_mask"].repeat_interleave(sampling_size, dim=0)
+        }
+
+        # Determine the length of the prompt to slice it off the output
+        if self.network.config.is_encoder_decoder:
+            prompt_length = 1
+            last = None
+        else:
+            prompt_length = batch["input_ids"].shape[-1]
+            last = None
+
+        # Generate sequences for the entire batch
+        outputs = self.network.generate(
+            **batch,
+            output_scores=True,
+            return_dict_in_generate=True,
+            max_new_tokens=self.length,
+            do_sample=True,
+            generation_config=self.gen_config
+        )
+
+        # Process scores for the generated tokens
+        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)
+        generated_sequences = outputs.sequences[:, prompt_length:last]
+
+        token_seq_logprobs = torch.gather(
+            all_logprobs, 2, generated_sequences[:, :, None]
+        ).squeeze(-1)
+
+        # Zero out log probabilities for padding tokens and any tokens
+        # generated after the first end-of-sequence (EOS) token.
+        first_eos_indices = get_token_first_indices(
+            generated_sequences, self.tokenizer.eos_token_id
+        )
+        non_pad_tokens = torch.cat(
+            (generated_sequences[:, 0].unsqueeze(1),
+             torch.where(
+                 self.tokenizer.pad_token_id == generated_sequences[:, 1:],
+                 torch.tensor(-1, device=self.device),
+                 generated_sequences[:, 1:])
+             ),
+            dim=1
+        )
+        non_pad_log_scores = torch.where(-1 != non_pad_tokens, token_seq_logprobs, torch.tensor(0., device=self.device))
+
+        for i, ix in enumerate(first_eos_indices):
+            non_pad_log_scores[i][0] = token_seq_logprobs[i][0]
+            if ix != -1:
+                non_pad_log_scores[i][ix] = token_seq_logprobs[i][ix]
+                if ix + 1 < non_pad_log_scores.shape[1]:
+                    non_pad_log_scores[i][ix + 1:] = 0.
+
+        seq_logprobs_flat = non_pad_log_scores.sum(dim=1) if sum else non_pad_log_scores
+
+        # Extract the generated token IDs (excluding the prompt)
+        output_tokens_flat = outputs.sequences[:, prompt_length:]
+
+        # Reshape the flat outputs back into a batched structure
+        # corresponding to the input contexts.
+        if sum:
+            seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size)
+        else:
+            seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size, -1)
+
+        # Decode all tokens and create TextSample objects
+        all_samples_decoded = self.tokenizer.batch_decode(output_tokens_flat, skip_special_tokens=True)
+        all_samples = [
+            TextSample(token_ids, text)
+            for token_ids, text in zip(output_tokens_flat, all_samples_decoded)
+        ]
+
+        return all_samples, seq_logprobs
+
     def log_score(self, samples, context="", grad=False, sum=True):
         """
         Computes log-probabilities for samples using a memory-efficient
@@ -350,208 +555,3 @@ class LMDistribution(BaseDistribution):
             all_logits = torch.cat(processed_logits, dim=1)
 
         return all_logits
-
-    def sample(self, context="", sampling_size=32, sum=True):
-        """
-        Samples sequences from the language model in the given context
-
-        Parameters
-        ----------
-        context: str
-            Contextual text for which to sample.
-        sampling_size: int
-            Number of sequences to sample.
-        sum: bool
-            Flag to return a token-level tensor of scores or sum them per sequence.
-
-        Returns
-        -------
-        tuple of (list of TextSample(tokens, text), tensor of logprobs)
-        """
-        if self.network.config.is_encoder_decoder:
-            assert context, "Context (encoder input) is mandatory for encoder-decoder models."
-        elif not context:
-            context = self.tokenizer.bos_token
-
-        tokenized_context = self.tokenizer(
-            context,
-            padding=True,
-            return_tensors="pt",
-            add_special_tokens=True
-        )
-        # Replicate the context for batch generation
-        tokenized_contexts = {k: v.to(self.network.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}
-
-        prompt_length = tokenized_contexts["input_ids"].shape[1]
-
-        # Generate sequences and scores in one go
-        outputs = self.network.generate(
-            **tokenized_contexts,
-            output_scores=True,
-            return_dict_in_generate=True,
-            max_new_tokens=self.length,
-            do_sample=True,
-            generation_config=self.gen_config
-        )
-
-        # Efficiently get logprobs for the generated tokens only
-        # Shape: [sampling_size, generated_length, vocab_size]
-        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)
-
-        # The actual generated tokens, excluding the prompt
-        generated_sequences = outputs.sequences[:, prompt_length:]
-
-        # Gather the logprobs of the specific tokens that were sampled
-        # Shape: [sampling_size, generated_length]
-        token_seq_logprobs = torch.gather(all_logprobs, 2, generated_sequences.unsqueeze(-1)).squeeze(-1)
-
-        # Create a mask to zero out logprobs for tokens after the first EOS token.
-        # This entire block replaces the slow Python `for` loop.
-        eos_token_id = self.tokenizer.eos_token_id
-        is_eos = (generated_sequences == eos_token_id)
-
-        # Find the index of the first EOS in each sequence
-        # cumsum will be 0 before the first True, 1 at the first True, and >1 after.
-        eos_mask = is_eos.cumsum(dim=1) <= 1
-
-        # Also create a mask for padding tokens, if any
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is not None:
-            pad_mask = (generated_sequences != pad_token_id)
-            final_mask = eos_mask & pad_mask
-        else:
-            final_mask = eos_mask
-
-        # Apply the combined mask to zero out irrelevant scores
-        final_logprobs = token_seq_logprobs.where(final_mask, 0.0)
-
-        seq_logprobs = final_logprobs.sum(dim=1) if sum else final_logprobs
-
-        # Decode all sequences in a single, optimized call
-        decoded_texts = self.tokenizer.batch_decode(generated_sequences, skip_special_tokens=True)
-
-        # Create the final list of samples
-        samples = [TextSample(tokens, text) for tokens, text in zip(generated_sequences, decoded_texts)]
-
-        return (samples, seq_logprobs)
-
-    def sample_batch(self, contexts, sampling_size=32, sum=True):
-        """
-        Generates samples for a batch of contexts.
-
-        This method processes multiple input contexts simultaneously, generating
-        a specified number of samples for each. It leverages batching to
-        efficiently perform generation on a GPU.
-
-        Parameters
-        ----------
-        contexts: list of str
-            A list of contextual text strings for which to sample.
-        sampling_size: int
-            The number of sequences to sample for each context in the list.
-        sum: bool
-            If True, returns the sum of log probabilities for each sequence.
-            If False, returns a tensor of token-level log probabilities.
-
-        Returns
-        -------
-        tuple of (list of lists of TextSample, torch.Tensor)
-            - A list of lists, where the outer list corresponds to the input
-              contexts and each inner list contains `sampling_size` TextSample
-              objects.
-            - A tensor containing the log probabilities of the generated
-              sequences, with shape `(num_contexts, sampling_size)` if `sum` is
-              True, or `(num_contexts, sampling_size, sequence_length)` if
-              `sum` is False.
-        """
-        if not isinstance(contexts, list) or not contexts:
-            raise ValueError("contexts must be a non-empty list of strings.")
-
-        # Tokenize the entire batch of contexts with padding
-        tokenized_contexts = self.tokenizer(
-            contexts,
-            padding=True,
-            return_tensors="pt",
-            add_special_tokens=True
-        ).to(self.device)
-
-        num_contexts = len(contexts)
-        total_batch_size = num_contexts * sampling_size
-
-        # Repeat the tokenized inputs to create a batch of size
-        # (num_contexts * sampling_size) where each context is repeated
-        # `sampling_size` times.
-        batch = {
-            "input_ids": tokenized_contexts["input_ids"].repeat_interleave(sampling_size, dim=0),
-            "attention_mask": tokenized_contexts["attention_mask"].repeat_interleave(sampling_size, dim=0)
-        }
-
-        # Determine the length of the prompt to slice it off the output
-        if self.network.config.is_encoder_decoder:
-            prompt_length = 1
-            last = None
-        else:
-            prompt_length = batch["input_ids"].shape[-1]
-            last = None
-
-        # Generate sequences for the entire batch
-        outputs = self.network.generate(
-            **batch,
-            output_scores=True,
-            return_dict_in_generate=True,
-            max_new_tokens=self.length,
-            do_sample=True,
-            generation_config=self.gen_config
-        )
-
-        # Process scores for the generated tokens
-        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)
-        generated_sequences = outputs.sequences[:, prompt_length:last]
-
-        token_seq_logprobs = torch.gather(
-            all_logprobs, 2, generated_sequences[:, :, None]
-        ).squeeze(-1)
-
-        # Zero out log probabilities for padding tokens and any tokens
-        # generated after the first end-of-sequence (EOS) token.
-        first_eos_indices = get_token_first_indices(
-            generated_sequences, self.tokenizer.eos_token_id
-        )
-        non_pad_tokens = torch.cat(
-            (generated_sequences[:, 0].unsqueeze(1),
-             torch.where(
-                 self.tokenizer.pad_token_id == generated_sequences[:, 1:],
-                 torch.tensor(-1, device=self.device),
-                 generated_sequences[:, 1:])
-             ),
-            dim=1
-        )
-        non_pad_log_scores = torch.where(-1 != non_pad_tokens, token_seq_logprobs, torch.tensor(0., device=self.device))
-
-        for i, ix in enumerate(first_eos_indices):
-            non_pad_log_scores[i][0] = token_seq_logprobs[i][0]
-            if ix != -1:
-                non_pad_log_scores[i][ix] = token_seq_logprobs[i][ix]
-                if ix + 1 < non_pad_log_scores.shape[1]:
-                    non_pad_log_scores[i][ix + 1:] = 0.
-
-        seq_logprobs_flat = non_pad_log_scores.sum(dim=1) if sum else non_pad_log_scores
-
-        # Extract the generated token IDs (excluding the prompt)
-        output_tokens_flat = outputs.sequences[:, prompt_length:]
-
-        # Reshape the flat outputs back into a batched structure
-        # corresponding to the input contexts.
-        if sum:
-            seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size)
-        else:
-            seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size, -1)
-
-        # Decode all tokens and create TextSample objects
-        all_samples_decoded = self.tokenizer.batch_decode(output_tokens_flat, skip_special_tokens=True)
-        all_samples = [
-            TextSample(token_ids, text)
-            for token_ids, text in zip(output_tokens_flat, all_samples_decoded)
-        ]
-
-        return all_samples, seq_logprobs

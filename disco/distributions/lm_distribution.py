@@ -97,6 +97,28 @@ class LMDistribution(BaseDistribution):
 
         self.network.requires_grad_(not frozen)
 
+    def string_to_textsample(self, text):
+        """
+        Convert a string to a TextSample namedtuple.
+
+        Parameters
+        ----------
+        text: str
+            The input text string to convert
+
+        Returns
+        -------
+        TextSample
+            A namedtuple containing token_ids and the original text
+        """
+        if not isinstance(text, str):
+            raise ValueError("Input must be a string")
+
+        # Tokenize the text
+        token_ids = self.tokenizer.encode(text, return_tensors="pt").squeeze()
+
+        return TextSample(token_ids=token_ids, text=text)
+
     def log_score(self, samples, context="", grad=False, sum=True):
         """Computes log-probabilities for the samples according
         to the language model network in the given context

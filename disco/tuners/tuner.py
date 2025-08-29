@@ -409,6 +409,8 @@ class Tuner():
                 samples, proposal_log_scores = sampler.sample(sampling_size=self.params["sampling_size"], context=context)
             self.metric_updated.dispatch("timing/generation_per_sample", t_sampling.elapsed / len(samples))
 
+            self.proposal.report_samples_stats(samples, context, self.metric_updated)
+
             # score the samples according to the target distribution
             with Timer() as t_scoring:
                 target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)

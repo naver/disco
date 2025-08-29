@@ -555,3 +555,17 @@ class LMDistribution(BaseDistribution):
             all_logits = torch.cat(processed_logits, dim=1)
 
         return all_logits
+
+    def report_samples_stats(self, samples, context, observable):
+        """
+        Reports statistics about the samples to the observable
+        """
+        pad_token_id = self.tokenizer.pad_token_id
+        print("context", context)
+        observable.dispatch("context_length", len(self.tokenizer(context)))
+
+        for sample in samples:
+            length_with_padding = len(sample.token_ids)
+            length_without_padding = sum(1 for token_id in sample.token_ids if token_id != pad_token_id)
+            observable.dispatch("sample_length_with_padding", length_with_padding)
+            observable.dispatch("sample_length_without_padding", length_without_padding)

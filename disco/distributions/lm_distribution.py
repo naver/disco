@@ -175,16 +175,15 @@ class LMDistribution(BaseDistribution):
             generation_config=self.gen_config
         )
 
-        # Efficiently get logprobs for the generated tokens only
-        # Shape: [sampling_size, generated_length, vocab_size]
-        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)
-
-        # The actual generated tokens, excluding the prompt
         generated_sequences = outputs.sequences[:, prompt_length:]
 
-        # Gather the logprobs of the specific tokens that were sampled
-        # Shape: [sampling_size, generated_length]
-        token_seq_logprobs = torch.gather(all_logprobs, 2, generated_sequences.unsqueeze(-1)).squeeze(-1)
+        logprobs_list = []
+        for i, scores_at_step in enumerate(outputs.scores):
+            generated_tokens_at_step = generated_sequences[:, i].unsqueeze(-1)
+            logprobs_at_step = scores_at_step.log_softmax(dim=-1)
+            token_logprob = torch.gather(logprobs_at_step, 1, generated_tokens_at_step)
+            logprobs_list.append(token_logprob)
+        token_seq_logprobs = torch.cat(logprobs_list, dim=1)
 
         # Create a mask to zero out logprobs for tokens after the first EOS token.
         # This entire block replaces the slow Python `for` loop.
@@ -208,7 +207,7 @@ class LMDistribution(BaseDistribution):
 
         seq_logprobs = final_logprobs.sum(dim=1) if sum else final_logprobs
 
-        # Decode all sequences in a single, optimized call
+        # Decode all sequences
         decoded_texts = self.tokenizer.batch_decode(generated_sequences, skip_special_tokens=True)
 
         # Create the final list of samples
@@ -380,7 +379,8 @@ class LMDistribution(BaseDistribution):
 
         # Reshape for cross_entropy
         batch_size, seq_len, vocab_size = shift_logits.shape
-        logits_for_loss = shift_logits.view(batch_size * seq_len, vocab_size)
+        # cast for consistency with sample scoring
+        logits_for_loss = shift_logits.view(batch_size * seq_len, vocab_size).float()
         labels_for_loss = shift_labels.view(batch_size * seq_len)
 
         # Calculate negative log-probabilities

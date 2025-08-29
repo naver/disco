@@ -329,22 +329,26 @@ class LMDistribution(BaseDistribution):
 
         # Decode all tokens and create TextSample objects
         all_samples_decoded = self.tokenizer.batch_decode(output_tokens_flat, skip_special_tokens=True)
-        all_samples = [
+        all_samples_flat = [
             TextSample(token_ids, text)
             for token_ids, text in zip(output_tokens_flat, all_samples_decoded)
         ]
 
-        return all_samples, seq_logprobs
+        # Reshape the flat list of samples into a nested list (list of lists)
+        all_samples_nested = [
+            all_samples_flat[i * sampling_size : (i + 1) * sampling_size]
+            for i in range(num_contexts)
+        ]
+
+        return all_samples_nested, seq_logprobs
 
     def log_score(self, samples, context="", grad=False, sum=True):
         """
-        Computes log-probabilities for samples using a memory-efficient
-        cross_entropy calculation with the CORRECT order of operations.
+        Computes log-probabilities for samples
         """
         shapes = {s.token_ids.shape for s in samples}
         assert len(shapes) == 1, "All sequences of token_ids must have the same shape."
 
-        # --- 1. PREPARE TOKENS ---
         if self.network.config.is_encoder_decoder:
             assert context, "Context is mandatory for encoder-decoder models."
         elif not context:
@@ -355,22 +359,18 @@ class LMDistribution(BaseDistribution):
 
         tokenized_samples = {"input_ids": torch.stack([s.token_ids for s in samples]).to(self.device)}
 
-        # --- 2. CREATE SAMPLE MASK ---
         # This adds the 'attention_mask' key to tokenized_samples.
         tokenized_samples = self._discount_padding_tokens(tokenized_samples)
 
-        # --- 3. PREPARE ALL MODEL INPUTS AND LABELS ---
         _, _, forward_kwargs, labels, prompt_length, _ = self._get_forward_inputs(
             tokenized_context, tokenized_samples, samples
         )
 
-        # --- 4. RUN FORWARD PASS ---
         with torch.set_grad_enabled(grad):
             outputs = self.network(**forward_kwargs)
 
         logits = outputs.logits
 
-        # --- 5. CALCULATE LOG PROBABILITIES ---
         # The labels tensor is already correctly formatted with -100 for ignored tokens.
 
         # Shift logits and labels for proper alignment
@@ -556,13 +556,96 @@ class LMDistribution(BaseDistribution):
 
         return all_logits
 
-    def report_samples_stats(self, samples, context, observable):
+    def log_score_batch(self, samples, contexts, grad=False, sum=True):
+        """
+        Computes log-probabilities for a batch of samples, each associated with a
+        corresponding context from a list.
+
+        Parameters
+        ----------
+        samples : list of lists of TextSample
+            A nested list of sample objects. Each list of sample objects
+            is paired with the corresponding context.
+        contexts : list of str
+            A list of contextual text strings. The length of this list is the
+            primary batch dimension.
+        grad : bool, optional
+            Whether to enable gradient computation, by default False.
+        sum : bool, optional
+            If True, returns the sum of log-probabilities for each sequence.
+            If False, returns a tensor of token-level log-probabilities.
+            By default True.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor containing the log-probabilities.
+            - If `sum` is True, shape is `(num_contexts, n_repeats)`.
+            - If `sum` is False, shape is `(num_contexts, n_repeats, sequence_length)`.
+        """
+        assert len(contexts) > 0
+        assert len(samples) == len(contexts)
+
+        num_contexts = len(contexts)
+        n_samples_per_context = len(samples[0])
+
+        # Tokenize all unique contexts at once with padding
+        tokenized_contexts_unique = self.tokenizer(
+            contexts, return_tensors="pt", add_special_tokens=True, padding=True
+        )
+
+        samples_flat = [s for sublist in samples for s in sublist]
+
+        # Repeat each context to align with the flat samples list
+        tokenized_context = {
+            k: v.repeat_interleave(n_samples_per_context, dim=0).to(self.device)
+            for k, v in tokenized_contexts_unique.items()
+        }
+
+        tokenized_samples = {"input_ids": torch.stack([s.token_ids for s in samples_flat]).to(self.device)}
+
+        tokenized_samples = self._discount_padding_tokens(tokenized_samples)
+
+        _, _, forward_kwargs, labels, _, _ = self._get_forward_inputs(
+            tokenized_context, tokenized_samples, samples_flat
+        )
+
+        with torch.set_grad_enabled(grad):
+            outputs = self.network(**forward_kwargs)
+
+        logits = outputs.logits
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        batch_size, seq_len, vocab_size = shift_logits.shape
+        logits_for_loss = shift_logits.view(batch_size * seq_len, vocab_size).float()
+        labels_for_loss = shift_labels.view(batch_size * seq_len)
+
+        token_neg_logprobs = F.cross_entropy(
+            logits_for_loss,
+            labels_for_loss,
+            reduction='none',
+            ignore_index=-100
+        )
+
+        seq_logprobs_flat = -token_neg_logprobs.view(batch_size, seq_len)
+
+        if sum:
+            summed_logprobs = seq_logprobs_flat.sum(dim=1)
+            return summed_logprobs.view(num_contexts, n_samples_per_context)
+        else:
+            return seq_logprobs_flat.view(num_contexts, n_samples_per_context, -1)
+
+
+    def report_samples_stats(self, samples, contexts, observable):
         """
         Reports statistics about the samples to the observable
         """
         pad_token_id = self.tokenizer.pad_token_id
-        print("context", context)
-        observable.dispatch("context_length", len(self.tokenizer(context)))
+        tokenized_contexts = self.tokenizer(contexts)
+        for context_ids in tokenized_contexts:
+            observable.dispatch("context_length", len(context_ids))
 
         for sample in samples:
             length_with_padding = len(sample.token_ids)

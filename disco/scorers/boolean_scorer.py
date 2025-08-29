@@ -20,39 +20,6 @@ class BooleanScorer(PositiveScorer):
         predicate: scoring predicate
             predicate function to be used on each sample
         """
+        super().__init__(predicate)
 
-        self.predicate = self._broadcast(predicate)
-
-    def log_score(self, samples, context):
-        """Returns log-probabilities for the samples
-        given the context by converting their scores to logspace 
-
-        Parameters
-        ----------
-        samples : list(Sample)
-            samples to score, as a list
-        context: text
-            context used for the samples
-
-        Returns
-        -------
-        tensor of (-np.Inf / 0) log-probabilities"""
-
-        return torch.log(self.score(samples, context=context))
-
-    def score(self, samples, context):
-        """Computes probabilities for samples and context
-        by casting the instance's predicate, ie scoring, function
-
-        Parameters
-        ----------
-        samples : list(Sample)
-            samples to score, as a list
-        context: text
-            context used for the samples
-
-        Returns
-        -------
-        tensor of (0 / 1) probabilities"""
-
-        return self.predicate(samples, context).float()
+        self.predicate = self._broadcast(lambda s, c: predicate(s, c).float())

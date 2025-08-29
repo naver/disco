@@ -9,11 +9,10 @@ from transformers import (get_constant_schedule_with_warmup,
                         get_linear_schedule_with_warmup,
                         get_cosine_schedule_with_warmup)
 
-
 from disco.tuners.losses import *
 from disco.samplers import AccumulationSampler
 from disco.metrics import KL, TV, JS
-from disco.utils.helpers import batchify
+from disco.utils.helpers import score_in_chunks_batched
 from disco.utils.observable import Observable, forward
 from disco.utils.device import to_same_device, get_device
 from disco.utils.moving_average import WindowedMovingAverage, MovingAverage
@@ -24,7 +23,6 @@ divergence_pointwise_estimates_funcs = {
         'tv': TV.pointwise_estimates,
         'kl': KL.pointwise_estimates,
         'js': JS.pointwise_estimates}
-
 
 class Tuner():
     """
@@ -95,8 +93,8 @@ class Tuner():
         torch.autograd.set_detect_anomaly(True)
         self.params = self.default_params
         self.params.update(params)
-        self.params['scoring_size'] = min(self.params['scoring_size'], self.params['n_samples_per_context'])
-        self.params['sampling_size'] = min(self.params['sampling_size'], self.params['n_samples_per_context'])
+        self.params['scoring_size'] = min(self.params['scoring_size'], self.params['n_contexts_per_step'] * self.params['n_samples_per_context'])
+        self.params['sampling_size'] = min(self.params['sampling_size'], self.params['n_contexts_per_step'] * self.params['n_samples_per_context'])
         self.target  = target
         if proposal:
             self.proposal = proposal
@@ -199,118 +197,32 @@ class Tuner():
             self.features_moments_proposal[label].update(proposal_moment_pointwise_estimates)
             self.features_moments_model[label].update(importance_ratios * proposal_moment_pointwise_estimates)
 
-    def _update_moving_z(self, proposal_log_scores, target_log_scores, context):
-        """
-        Improves the `z` importance sampling estimate of Z
-        by averaging new samples
-
-        Parameters
-        ----------
-        proposal_log_scores: array of floats
-            log-probabilities of the samples according to the proposal
-        target_log_scores: array of floats
-            log-probabilities of the samples according to the target
-        context: text
-            context for the samples
-        """
+    def _update_moving_z(self, contexts, proposal_log_scores, target_log_scores):
         target_log_scores, proposal_log_scores = to_same_device(target_log_scores, proposal_log_scores)
+        z_pointwise_estimates_batch = torch.exp(target_log_scores - proposal_log_scores)
+        for i, context in enumerate(contexts):
+            self.z[context].update(z_pointwise_estimates_batch[i])
+            self.metric_updated.dispatch('z', self.z[context].value)
 
-        z_pointwise_estimates = torch.exp(target_log_scores - proposal_log_scores)
-        self.z[context].update(z_pointwise_estimates)
-        self.metric_updated.dispatch('z', self.z[context].value)
+    def _update_divergence_estimates(self, estimates_dict, contexts, p_log_scores, q_log_scores, use_z=False, proposal_log_scores=None):
+        p_log_scores, q_log_scores = to_same_device(p_log_scores, q_log_scores)
+        if proposal_log_scores is not None:
+            proposal_log_scores = proposal_log_scores.to(p_log_scores.device)
 
-    def _update_divergence_estimates_target_proposal(self, proposal_log_scores, target_log_scores, context):
-        """
-        Improves the importance sampling estimate of D(p||q)
-        for every divergence D by averaging new samples
+        z_values = torch.tensor([self.z[c].value if use_z else 1.0 for c in contexts], device=p_log_scores.device)
+        valid_mask = z_values > 0
 
-        Parameters
-        ----------
-        proposal_log_scores: array of floats
-            log-probabilities of the samples according to the proposal
-        target_log_scores: array of floats
-            log-probabilities of the samples according to the target
-        context: text
-            context for the samples
-        """
-        target_log_scores, proposal_log_scores = to_same_device(target_log_scores, proposal_log_scores)
+        if not torch.any(valid_mask):
+            return
 
-        if self.z[context].value > 0:
-            for divergence_type, _ in self.divergence_estimates_target_proposal.items():
-                self.divergence_estimates_target_proposal[divergence_type].update(
-                    divergence_pointwise_estimates_funcs[divergence_type](
-                        target_log_scores, proposal_log_scores, self.z[context].value))
-
-    def _update_divergence_estimates_target_model(self, proposal_log_scores, target_log_scores, model_log_scores, context):
-        """
-        Improves the importance sampling estimates of D(p||q)
-        for every divergence D by averaging new samples
-
-        Parameters
-        ----------
-        proposal_log_scores: array of floats
-            log-probabilities of the samples according to the proposal
-        target_log_scores: array of floats
-            log-probabilities of the samples according to the target
-        model_log_scores: array of floats
-            log-probabilities of the samples according to the model
-        context: text
-            context for the samples
-        """
-        target_log_scores, model_log_scores, proposal_log_scores = to_same_device(
-                target_log_scores, model_log_scores, proposal_log_scores)
-
-        if self.z[context].value > 0:
-            for divergence_type, _ in self.divergence_estimates_target_model.items():
-                self.divergence_estimates_target_model[divergence_type].update(
-                    divergence_pointwise_estimates_funcs[divergence_type](
-                        target_log_scores, model_log_scores, self.z[context].value,
-                        proposal_log_scores=proposal_log_scores))
-
-    def _update_divergence_estimates_proposal_base(self, proposal_log_scores, base_log_scores, context):
-        """
-        Improves the importance sampling estimate of D(p||q)
-        for every divergence D by averaging new samples
-
-        Parameters
-        ----------
-        proposal_log_scores: array of floats
-            log-probabilities of the samples according to the proposal
-        base_log_scores: array of floats
-            log-probabilities of the samples according to the base
-        context: text
-            context for the samples
-        """
-        base_log_scores, proposal_log_scores = to_same_device(base_log_scores, proposal_log_scores)
-
-        for divergence_type, _ in self.divergence_estimates_target_proposal.items():
-            self.divergence_estimates_proposal_base[divergence_type].update(
-                divergence_pointwise_estimates_funcs[divergence_type](
-                    proposal_log_scores, base_log_scores, torch.as_tensor(1), proposal_log_scores))
-
-    def _update_divergence_estimates_model_base(self, proposal_log_scores, model_log_scores, base_log_scores, context):
-        """
-        Improves the importance sampling estimate of D(p||q)
-        for every divergence D by averaging new samples
-
-        Parameters
-        ----------
-        proposal_log_scores: array of floats
-            log-probabilities of the samples according to the proposal
-        model_log_scores: array of floats
-            log-probabilities of the samples according to the model
-        base_log_scores: array of floats
-            log-probabilities of the samples according to the base
-        context: text
-            context for the samples
-        """
-        model_log_scores, base_log_scores, proposal_log_scores = \
-                to_same_device(model_log_scores, base_log_scores, proposal_log_scores)
-
-        for divergence_type, _ in self.divergence_estimates_target_proposal.items():
-            self.divergence_estimates_model_base[divergence_type].update(
-                divergence_pointwise_estimates_funcs[divergence_type](
-                    model_log_scores, base_log_scores, torch.as_tensor(1), proposal_log_scores))
+        for div_type, estimator in estimates_dict.items():
+            pointwise_estimates = divergence_pointwise_estimates_funcs[div_type](
+                p_log_scores[valid_mask],
+                q_log_scores[valid_mask],
+                z_values[valid_mask].unsqueeze(1),
+                proposal_log_scores=proposal_log_scores[valid_mask] if proposal_log_scores is not None else None
+            )
+            estimator.update(pointwise_estimates.flatten())
 
     def _report_importance_sampling_estimates(self, estimates_dict, distributions_name):
         """
@@ -329,7 +241,7 @@ class Tuner():
                 self.metric_updated.dispatch(f"{metric_name}_{distributions_name}",
                         metric_estimates.value)
 
-    def _report_all_importance_sampling_estimates(self, context):
+    def _report_all_importance_sampling_estimates(self):
         """
         Reports all tracked metrics for a given context
         """
@@ -357,34 +269,32 @@ class Tuner():
         else:
             self.metric_updated.dispatch('proposal_updated', 0)
 
-    def _compute_gradient(self, samples, proposal_log_scores, target_log_scores, model_log_scores, context, n_steps):
+    def _compute_gradient_batched(self, samples_nested, proposal_log_scores, target_log_scores, model_log_scores, contexts, n_steps):
         """
-        Computes the gradient on a minibatch of samples
-
-        Parameters
-        ----------
-        samples: list of items
-            samples from the proposal network
-        proposal_log_scores: array of floats
-            log-probabilities for the samples according to the proposal
-        target_log_scores: array of floats
-            log-probabilities for the samples according to the target
-        model_log_scores: array of floats
-            log-probabilities for the samples according to the model
-        context: text
-            context for the samples
-        n_steps: int
-            number of accumulation steps
+        Computes the gradient on a minibatch of samples across all contexts.
         """
-        proposal_log_scores, target_log_scores, model_log_scores = to_same_device(
-                proposal_log_scores, target_log_scores, model_log_scores)
-        z_value = self.z[context].value
+        z_values = [self.z[c].value for c in contexts]
 
-        if z_value > 0:
-            z = torch.tensor(z_value, device=model_log_scores.device, dtype=model_log_scores.dtype)
-            loss = self._loss(samples, context, proposal_log_scores, target_log_scores, model_log_scores, z) / n_steps
-            self.metric_updated.dispatch('loss', loss.item())
-            loss.backward()
+        losses = []
+        for i, context in enumerate(contexts):
+            z_value = z_values[i]
+            if z_value > 0:
+                z = torch.tensor(z_value, device=model_log_scores.device, dtype=model_log_scores.dtype)
+                loss = self._loss(
+                    samples_nested[i], context, proposal_log_scores[i],
+                    target_log_scores[i], model_log_scores[i], z
+                )
+                losses.append(loss)
+
+        if not losses:
+            return
+
+        # Aggregate losses and perform a single backward pass
+        total_loss = torch.stack(losses).mean()
+        scaled_loss = total_loss / n_steps
+
+        self.metric_updated.dispatch('loss', scaled_loss.item())
+        scaled_loss.backward()
 
     def _step(self):
         """
@@ -396,67 +306,97 @@ class Tuner():
           - applies the accumulated gradients
 
         """
-        # counters for statistics
-        n_samples_to_boost, n_samples_to_downweight = 0, 0
-
-        # iterate over n_contexts_per_step contexts
         contexts = self._get_next_context_batch()
-        for context in tqdm(contexts, desc="contexts", leave=False):
+        num_contexts = len(contexts)
+        sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
 
-            # obtain samples conditioned on this context
-            sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
-            with Timer() as t_sampling:
-                samples, proposal_log_scores = sampler.sample(sampling_size=self.params["sampling_size"], context=context)
-            self.metric_updated.dispatch("timing/generation_per_sample", t_sampling.elapsed / len(samples))
+        with Timer() as t_sampling:
+            samples_nested, proposal_log_scores = sampler.sample_batch(
+                contexts=contexts,
+                sampling_size=self.params["sampling_size"]
+            )
+            samples_flat = [s for sublist in samples_nested for s in sublist]
+        self.metric_updated.dispatch("timing/generation_per_sample", t_sampling.elapsed / len(samples_flat))
 
-            self.proposal.report_samples_stats(samples, context, self.metric_updated)
+        scoring_size = self.params["scoring_size"]
 
-            # score the samples according to the target distribution
-            with Timer() as t_scoring:
-                target_log_scores = batchify(self.target.log_score, self.params["scoring_size"], samples=samples, context=context)
-            self.metric_updated.dispatch("timing/target_scoring_per_sample", t_scoring.elapsed / len(samples))
+        with Timer() as t_scoring:
+            target_log_scores = score_in_chunks_batched(
+                self.target, samples_nested, contexts, scoring_size
+            )
+        self.metric_updated.dispatch("timing/target_scoring_per_sample", t_scoring.elapsed / len(samples_flat))
 
-            # update importance sampling statistics
-            self._update_moving_z(proposal_log_scores, target_log_scores, context)
-            self._update_divergence_estimates_target_proposal(proposal_log_scores, target_log_scores, context)
+        if self.track_divergence_from_base:
+            base = self.target.scorers[0]
+            base_log_scores = score_in_chunks_batched(
+                base, samples_nested, contexts, scoring_size
+            )
+
+        self.proposal.report_samples_stats(samples_flat, contexts, self.metric_updated)
+        self._update_moving_z(contexts, proposal_log_scores, target_log_scores)
+        self._update_divergence_estimates(self.divergence_estimates_target_proposal, contexts, target_log_scores, proposal_log_scores, use_z=True)
+        if self.track_divergence_from_base:
+             self._update_divergence_estimates(self.divergence_estimates_proposal_base, contexts, proposal_log_scores, base_log_scores, use_z=False, proposal_log_scores=proposal_log_scores)
+
+        n_samples_to_boost, n_samples_to_downweight = 0, 0
+        n_steps = len(contexts) * self.params["n_samples_per_context"] // self.params["scoring_size"]
+
+        mb_scoring_size = scoring_size // len(contexts)
+
+        for s in trange(n_steps, desc="mini-steps", leave=False):
+            self.ministep_idx_updated.dispatch(s)
+            minibatch_slice = slice(s * mb_scoring_size, (s + 1) * mb_scoring_size)
+
+            mb_samples_nested = [sublist[minibatch_slice] for sublist in samples_nested]
+
+            mb_proposal_log_scores = proposal_log_scores[:, minibatch_slice]
+            mb_target_log_scores = target_log_scores[:, minibatch_slice]
             if self.track_divergence_from_base:
-                base = self.target.scorers[0]
-                base_log_scores = batchify(base.log_score, self.params["scoring_size" ], samples=samples, context=context)
-                self._update_divergence_estimates_proposal_base(proposal_log_scores, base_log_scores, context)
+                mb_base_log_scores = base_log_scores[:, minibatch_slice]
 
-            # peform n_steps forward/backward passes to accumulate gradients
-            n_steps = self.params["n_samples_per_context"] // self.params["scoring_size"]
-            for s in trange(n_steps, desc="mini-steps", leave=False):
-                self.ministep_idx_updated.dispatch(s)
-                minibatch_slice = slice(s * self.params["scoring_size"], (s + 1) * self.params["scoring_size"])
+            mb_model_log_scores = self.model.log_score_batch(
+                samples=mb_samples_nested,
+                contexts=contexts,
+                grad=True
+            )
 
-                mb_samples = samples[minibatch_slice]
-                mb_proposal_log_scores = proposal_log_scores[minibatch_slice]
-                mb_target_log_scores = target_log_scores[minibatch_slice]
-                mb_model_log_scores = self.model.log_score(mb_samples, context=context, grad=True)
+            # Detach model scores for metric calculations to not affect gradients
+            detached_model_scores = mb_model_log_scores.detach()
 
-                # also report policy dependent scores
-                self._update_divergence_estimates_target_model(
-                        mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores.detach(), context)
-                if self.track_divergence_from_base:
-                    mb_base_log_scores = base_log_scores[minibatch_slice]
-                    self._update_divergence_estimates_model_base(mb_proposal_log_scores, mb_model_log_scores.detach(), mb_base_log_scores, context)
+            # Batched updates for model-dependent metrics
+            self._update_divergence_estimates(self.divergence_estimates_target_model, contexts, mb_target_log_scores, detached_model_scores, use_z=True, proposal_log_scores=mb_proposal_log_scores)
+            if self.track_divergence_from_base:
+                self._update_divergence_estimates(self.divergence_estimates_model_base, contexts, detached_model_scores, mb_base_log_scores, use_z=False, proposal_log_scores=mb_proposal_log_scores)
+
+            # Dispatch eval samples
+            for i, context in enumerate(contexts):
                 self.eval_samples_updated.dispatch(
-                        context, mb_samples, mb_proposal_log_scores, mb_model_log_scores.detach(), mb_target_log_scores)
+                    context, mb_samples_nested[i], mb_proposal_log_scores[i],
+                    detached_model_scores[i], mb_target_log_scores[i]
+                )
 
-                with Timer() as t_backprop:
-                    self._compute_gradient(
-                        mb_samples, mb_proposal_log_scores, mb_target_log_scores, mb_model_log_scores,
-                        context, n_steps * self.params["n_contexts_per_step"])
-                self.metric_updated.dispatch("timing/backpropagation_per_sample", t_backprop.elapsed / len(mb_samples))
+            # Batched gradient computation
+            with Timer() as t_backprop:
+                self._compute_gradient_batched(
+                    mb_samples_nested, mb_proposal_log_scores, mb_target_log_scores,
+                    mb_model_log_scores, contexts, n_steps
+                )
+            self.metric_updated.dispatch("timing/backpropagation_per_sample", t_backprop.elapsed / scoring_size)
 
-                mb_in_support = ~mb_target_log_scores.isneginf()
-                mb_in_support_target_norm_log_scores = mb_target_log_scores[mb_in_support] - \
-                    torch.log(torch.tensor(self.z[context].value, device=mb_target_log_scores.device))
-                n_samples_to_boost += (mb_in_support_target_norm_log_scores > mb_model_log_scores[mb_in_support]).sum().item()
-                n_samples_to_downweight += (mb_in_support_target_norm_log_scores < mb_model_log_scores[mb_in_support]).sum().item()
+            # Batched boost/downweight stats calculation
+            z_values_tensor = torch.tensor([self.z[c].value for c in contexts], device=mb_target_log_scores.device).unsqueeze(1)
+            in_support = ~mb_target_log_scores.isneginf()
+            valid_z = z_values_tensor > 0
+            valid_mask = in_support & valid_z
 
-            self._report_all_importance_sampling_estimates(context)
+            if torch.any(valid_mask):
+                norm_target_scores = mb_target_log_scores[valid_mask] - torch.log(z_values_tensor.expand_as(mb_target_log_scores)[valid_mask])
+                model_scores_valid = detached_model_scores[valid_mask]
+                n_samples_to_boost += (norm_target_scores > model_scores_valid).sum().item()
+                n_samples_to_downweight += (norm_target_scores < model_scores_valid).sum().item()
+
+        # Report final metrics after all mini-batches
+        self._report_all_importance_sampling_estimates()
 
         self.metric_updated.dispatch("n_samples_to_boost", n_samples_to_boost)
         self.metric_updated.dispatch("n_samples_to_downweight", n_samples_to_downweight)
@@ -510,14 +450,16 @@ class Tuner():
         """
         val_dataloader = torch.utils.data.DataLoader(self.val_dataset, batch_size=self.params["sampling_size"], shuffle=False, collate_fn=lambda x: x)
         val_model = self.model.validation()
-        features_moments = dict()
-        for (label, feature) in self.features:
-            features_moments[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+        features_moments = {label: WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"]) for label, _ in self.features}
+
         for val_contexts in tqdm(val_dataloader, desc="validation", leave=False):
+            # We sample one per context
             samples, _ = val_model.sample_batch(val_contexts, sampling_size=1)
+
             for (label, feature) in self.features:
-                for sample, context in zip(samples, val_contexts):
-                    proposal_moment_pointwise_estimate = feature.log_score([sample], context=context).exp()
-                    features_moments[label].update(proposal_moment_pointwise_estimate)
+                for context, context_samples in zip(val_contexts, samples):
+                    pointwise_estimates = feature.log_score(context_samples, context=context).exp()
+                    features_moments[label].update(pointwise_estimates)
+
         for (label, _) in self.features:
             self.metric_updated.dispatch(f"val_{label}", features_moments[label].value)

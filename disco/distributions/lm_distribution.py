@@ -53,7 +53,7 @@ class LMDistribution(BaseDistribution):
 
         if isinstance(model, str):
             # assume also the tokenizer is a str
-            self.tokenizer= AutoTokenizer.from_pretrained(tokenizer if tokenizer else model)
+            self.tokenizer= AutoTokenizer.from_pretrained(tokenizer if tokenizer else model, padding_side="left")
             assert auto in [AutoModelForCausalLM, AutoModelForSeq2SeqLM], "only AutoModel, AutoModelForCausalLM and AutoModelForSeq2SeqLM are valid options."
             self._load_network(auto, model, device)
         else:

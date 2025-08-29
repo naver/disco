@@ -295,12 +295,15 @@ class LMDistribution(BaseDistribution):
         )
 
         # Process scores for the generated tokens
-        all_logprobs = torch.stack(outputs.scores, dim=1).log_softmax(-1)
         generated_sequences = outputs.sequences[:, prompt_length:last]
 
-        token_seq_logprobs = torch.gather(
-            all_logprobs, 2, generated_sequences[:, :, None]
-        ).squeeze(-1)
+        logprobs_list = []
+        for i, scores_at_step in enumerate(outputs.scores):
+            generated_tokens_at_step = generated_sequences[:, i].unsqueeze(-1)
+            logprobs_at_step = scores_at_step.log_softmax(dim=-1)
+            token_logprob = torch.gather(logprobs_at_step, 1, generated_tokens_at_step)
+            logprobs_list.append(token_logprob)
+        token_seq_logprobs = torch.cat(logprobs_list, dim=1)
 
         # Zero out log probabilities for padding tokens and any tokens
         # generated after the first end-of-sequence (EOS) token.

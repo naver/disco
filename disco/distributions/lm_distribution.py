@@ -28,7 +28,7 @@ class LMDistribution(BaseDistribution):
 
     def __init__(self,
             model="gpt2", tokenizer=None, auto=AutoModelForCausalLM, freeze=True,
-            length=40, device="cpu",
+            length=40, device="cpu", process_context_fn=None,
             **config
         ):
         """
@@ -47,6 +47,8 @@ class LMDistribution(BaseDistribution):
             number of tokens in the samples
         device: string
             reference of the computing device
+        process_context_fn: function
+            a callback that processes the context before feeding it to the model
         config: kwarg
             parameters and values passed to transformers' ```generate(…)```
         """
@@ -67,6 +69,8 @@ class LMDistribution(BaseDistribution):
             self.freeze(True)
 
         self.length = length
+
+        self.process_context_fn = process_context_fn
 
         self.gen_config = GenerationConfig(**{
             "top_k": 0,
@@ -153,6 +157,9 @@ class LMDistribution(BaseDistribution):
             assert context, "Context (encoder input) is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
+
+        if self.process_context_fn:
+            context = (self.process_context_fn)(context)
 
         tokenized_context = self.tokenizer(
             context,
@@ -246,6 +253,9 @@ class LMDistribution(BaseDistribution):
         """
         if not isinstance(contexts, list) or not contexts:
             raise ValueError("contexts must be a non-empty list of strings.")
+
+        if self.process_context_fn:
+            contexts = [(self.process_context_fn)(context) for context in contexts]
 
         # Tokenize the entire batch of contexts with padding
         tokenized_contexts = self.tokenizer(
@@ -353,6 +363,9 @@ class LMDistribution(BaseDistribution):
             assert context, "Context is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
+
+        if self.process_context_fn:
+            context = (self.process_context_fn)(context)
 
         tokenized_context = self.tokenizer([context] * len(samples), return_tensors="pt", add_special_tokens=True, padding=True)
         tokenized_context = {k: v.to(self.device) for k, v in tokenized_context.items()}
@@ -586,6 +599,9 @@ class LMDistribution(BaseDistribution):
         assert len(contexts) > 0
         assert len(samples) == len(contexts)
 
+        if self.process_context_fn:
+            contexts = [(self.process_context_fn)(context) for context in contexts]
+
         num_contexts = len(contexts)
         n_samples_per_context = len(samples[0])
 
@@ -643,6 +659,10 @@ class LMDistribution(BaseDistribution):
         Reports statistics about the samples to the observable
         """
         pad_token_id = self.tokenizer.pad_token_id
+
+        if self.process_context_fn:
+            contexts = [(self.process_context_fn)(context) for context in contexts]
+
         tokenized_contexts = self.tokenizer(contexts)
         for context_ids in tokenized_contexts:
             observable.dispatch("context_length", len(context_ids))

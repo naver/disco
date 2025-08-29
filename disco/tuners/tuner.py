@@ -39,11 +39,11 @@ class Tuner():
         value: scalar
     proposal_updated: reports the new proposal distribution when it is updated
         proposal: Distribution
-    eval_samples_updated: reports a fresh set of samples that the network has not yet been trained on
+    eval_samples_updated: reports a fresh set of samples that the model has not yet been trained on
         context: text
         samples: list
         proposal_log_scores: list of floats
-        model_log_scores: list of floats
+        policy_log_scores: list of floats
         target_log_scores: list of floats
     """
 
@@ -58,24 +58,24 @@ class Tuner():
         "sampling_size": 2**5, # number of samples requested per sampling
         "n_contexts_per_step": 2**4, # number of different contexts to sample per gradient step
         "proposal_update_interval": 2**4, # number of gradient steps every which to update the proposal in offline learning
-        "proposal_update_metric": "kl", # the proposal will be updated if the model is better according to this metric
+        "proposal_update_metric": "kl", # the proposal will be updated if the policy is better according to this metric
         "estimates_rolling_window_size": 2**8, # number of samples to accumulate in a rollowing window estimate
         "validation_interval": 2**4, # number of steps every which to compute feature moments on the validation contexts
         "validate_on_start": True,
     }
 
-    def __init__(self, model, target, proposal=None, context_dataset=None, val_dataset=None, loss=JSLoss(), features=[],
+    def __init__(self, policy, target, proposal=None, context_dataset=None, val_dataset=None, loss=JSLoss(), features=[],
             track_metrics=["kl", "tv", "js"], track_divergence_from_base=False, **params):
         """
         Parameters
         ----------
-        model: distribution
-            model distribution, to be tuned
+        policy: distribution
+            policy distribution, to be tuned
         target: product
             EBM made of a distribution and one or multiple (log-)scorers
         proposal: distribution
             sampling distribution, if specified tuning is offline
-            else online (model is also used to sample from)
+            else online (policy is also used to sample from)
         context_distribution: distribution
             to contextualize the sampling from the proposal
         loss: function
@@ -84,7 +84,7 @@ class Tuner():
             feature monitored during the tuning
         track_metrics: list of strings
             metrics used to report differences between the target and the
-            model/proposal distributions.
+            policy/proposal distributions.
         track_divergence_from_base: boolean
             whether or not track divergence from the base model of the EBM
         params: dictionary
@@ -100,9 +100,9 @@ class Tuner():
             self.proposal = proposal
             self.learning = "offline"
         else:
-            self.proposal = model
+            self.proposal = policy
             self.learning = "online"
-        self.model = model
+        self.policy = policy
 
         self.context_dataloader = torch.utils.data.DataLoader(context_dataset, batch_size=self.params["n_contexts_per_step"], shuffle=False, collate_fn=lambda x: x)
         self.context_iterator = iter(self.context_dataloader)
@@ -114,11 +114,11 @@ class Tuner():
         self.features = list(features)
 
         if "AdamW" == self.params["optimizer"]:
-            self.optimizer = torch.optim.AdamW(self.model.network.parameters(), lr=self.params["learning_rate"])
+            self.optimizer = torch.optim.AdamW(self.policy.model.parameters(), lr=self.params["learning_rate"])
         if "SGD" == self.params["optimizer"]:
-            self.optimizer = torch.optim.SGD(self.model.network.parameters(), lr=self.params["learning_rate"])
+            self.optimizer = torch.optim.SGD(self.policy.model.parameters(), lr=self.params["learning_rate"])
         else:
-            self.optimizer = torch.optim.Adam(self.model.network.parameters(), lr=self.params["learning_rate"])
+            self.optimizer = torch.optim.Adam(self.policy.model.parameters(), lr=self.params["learning_rate"])
 
         if "linear" == self.params["scheduler"]:
             self.scheduler = get_linear_schedule_with_warmup(self.optimizer, self.params["warmup_steps"], self.params["n_gradient_steps"])
@@ -143,34 +143,34 @@ class Tuner():
 
         self.z = defaultdict(MovingAverage)
         self.divergence_estimates_target_proposal = dict()
-        self.divergence_estimates_target_model = dict()
+        self.divergence_estimates_target_policy = dict()
         for metric in track_metrics:
             assert metric in divergence_pointwise_estimates_funcs, \
                     f"Unknown metric {metric}. " \
                     f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
             self.divergence_estimates_target_proposal[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
-            self.divergence_estimates_target_model[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+            self.divergence_estimates_target_policy[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
 
         self.track_divergence_from_base = track_divergence_from_base
         if self.track_divergence_from_base:
             self.divergence_estimates_proposal_base = dict()
-            self.divergence_estimates_model_base = dict()
+            self.divergence_estimates_policy_base = dict()
             for metric in track_metrics:
                 assert metric in divergence_pointwise_estimates_funcs, \
                         f"Unknown metric {metric}. " \
                         f"Options are: {list(divergence_pointwise_estimates_funcs.keys())}"
                 self.divergence_estimates_proposal_base[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
-                self.divergence_estimates_model_base[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+                self.divergence_estimates_policy_base[metric] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
 
         self.features_moments_proposal = dict()
-        self.features_moments_model = dict()
+        self.features_moments_policy = dict()
         for (label, feature) in self.features:
             self.features_moments_proposal[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
-            self.features_moments_model[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
+            self.features_moments_policy[label] = WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"])
         if self.features:
             self.eval_samples_updated.enroll(self._update_features_moments)
 
-    def _update_features_moments(self, context, samples, proposal_log_scores, model_log_scores, target_log_scores):
+    def _update_features_moments(self, context, samples, proposal_log_scores, policy_log_scores, target_log_scores):
         """
         Improves the importance sampling estimates of the feature moments
         specified on construction of the Tuner
@@ -180,22 +180,22 @@ class Tuner():
         context: text
             context for the samples
         samples: list of items
-            samples from the proposal network
+            samples from the proposal model
         proposal_log_scores: array of floats
             log-probabilities for the samples according to the proposal
-        model_log_scores: array of floats
-            log-probabilities for the samples according to the model
+        policy_log_scores: array of floats
+            log-probabilities for the samples according to the policy
         target_log_scores: array of floats
             log-probabilities for the samples according to the target
         """
         device = get_device(proposal_log_scores)
-        model_log_scores = model_log_scores.to(device)
-        logweights = model_log_scores - proposal_log_scores
+        policy_log_scores = policy_log_scores.to(device)
+        logweights = policy_log_scores - proposal_log_scores
         importance_ratios = torch.exp(logweights)
         for (label, feature) in self.features:
             proposal_moment_pointwise_estimates = feature.log_score(samples, context=context).exp().to(device)
             self.features_moments_proposal[label].update(proposal_moment_pointwise_estimates)
-            self.features_moments_model[label].update(importance_ratios * proposal_moment_pointwise_estimates)
+            self.features_moments_policy[label].update(importance_ratios * proposal_moment_pointwise_estimates)
 
     def _update_moving_z(self, contexts, proposal_log_scores, target_log_scores):
         target_log_scores, proposal_log_scores = to_same_device(target_log_scores, proposal_log_scores)
@@ -245,31 +245,31 @@ class Tuner():
         """
         Reports all tracked metrics for a given context
         """
-        self._report_importance_sampling_estimates(self.divergence_estimates_target_model, 'target_model')
+        self._report_importance_sampling_estimates(self.divergence_estimates_target_policy, 'target_policy')
         self._report_importance_sampling_estimates(self.divergence_estimates_target_proposal, 'target_proposal')
         if self.track_divergence_from_base:
-            self._report_importance_sampling_estimates(self.divergence_estimates_model_base, 'model_base')
+            self._report_importance_sampling_estimates(self.divergence_estimates_policy_base, 'policy_base')
             self._report_importance_sampling_estimates(self.divergence_estimates_proposal_base, 'proposal_base')
         self._report_importance_sampling_estimates(self.features_moments_proposal, 'proposal')
-        self._report_importance_sampling_estimates(self.features_moments_model, 'model')
+        self._report_importance_sampling_estimates(self.features_moments_policy, 'policy')
 
     def _update_proposal_if_better(self):
         """
-            Checks if D(p||.) is lower for model than for the proposal
+            Checks if D(p||.) is lower for policy than for the proposal
             and if so, updates the proposal
         """
         divergence_target_proposal = average(self.divergence_estimates_target_proposal[self.params["proposal_update_metric"]])
-        divergence_target_model = average(self.divergence_estimates_target_model[self.params["proposal_update_metric"]])
+        divergence_target_policy = average(self.divergence_estimates_target_policy[self.params["proposal_update_metric"]])
         if divergence_target_proposal > \
-                divergence_target_model:
-            self.proposal.network.load_state_dict(self.model.network.state_dict())
+                divergence_target_policy:
+            self.proposal.model.load_state_dict(self.policy.model.state_dict())
             self.metric_updated.dispatch('proposal_updated', 1)
             self.proposal_updated.dispatch(self.proposal, self.params['proposal_update_metric'],
-                                            divergence_target_model, divergence_target_proposal)
+                                            divergence_target_policy, divergence_target_proposal)
         else:
             self.metric_updated.dispatch('proposal_updated', 0)
 
-    def _compute_gradient_batched(self, samples_nested, proposal_log_scores, target_log_scores, model_log_scores, contexts, n_steps):
+    def _compute_gradient_batched(self, samples_nested, proposal_log_scores, target_log_scores, policy_log_scores, contexts, n_steps):
         """
         Computes the gradient on a minibatch of samples across all contexts.
         """
@@ -279,10 +279,10 @@ class Tuner():
         for i, context in enumerate(contexts):
             z_value = z_values[i]
             if z_value > 0:
-                z = torch.tensor(z_value, device=model_log_scores.device, dtype=model_log_scores.dtype)
+                z = torch.tensor(z_value, device=policy_log_scores.device, dtype=policy_log_scores.dtype)
                 loss = self._loss(
                     samples_nested[i], context, proposal_log_scores[i],
-                    target_log_scores[i], model_log_scores[i], z
+                    target_log_scores[i], policy_log_scores[i], z
                 )
                 losses.append(loss)
 
@@ -298,10 +298,10 @@ class Tuner():
 
     def _step(self):
         """
-        Performs a tuning step of the model distribution's network
+        Performs a tuning step of the policy distribution's model
 
         Performs a single step of gradient updates on a batch of samples:
-          - obtains samples and their log-scores from the proposal network
+          - obtains samples and their log-scores from the proposal model
           - repeats gradient computations, with minibatches
           - applies the accumulated gradients
 
@@ -354,32 +354,32 @@ class Tuner():
             if self.track_divergence_from_base:
                 mb_base_log_scores = base_log_scores[:, minibatch_slice]
 
-            mb_model_log_scores = self.model.log_score_batch(
+            mb_policy_log_scores = self.policy.log_score_batch(
                 samples=mb_samples_nested,
                 contexts=contexts,
                 grad=True
             )
 
-            # Detach model scores for metric calculations to not affect gradients
-            detached_model_scores = mb_model_log_scores.detach()
+            # Detach policy scores for metric calculations to not affect gradients
+            detached_policy_scores = mb_policy_log_scores.detach()
 
-            # Batched updates for model-dependent metrics
-            self._update_divergence_estimates(self.divergence_estimates_target_model, contexts, mb_target_log_scores, detached_model_scores, use_z=True, proposal_log_scores=mb_proposal_log_scores)
+            # Batched updates for policy-dependent metrics
+            self._update_divergence_estimates(self.divergence_estimates_target_policy, contexts, mb_target_log_scores, detached_policy_scores, use_z=True, proposal_log_scores=mb_proposal_log_scores)
             if self.track_divergence_from_base:
-                self._update_divergence_estimates(self.divergence_estimates_model_base, contexts, detached_model_scores, mb_base_log_scores, use_z=False, proposal_log_scores=mb_proposal_log_scores)
+                self._update_divergence_estimates(self.divergence_estimates_policy_base, contexts, detached_policy_scores, mb_base_log_scores, use_z=False, proposal_log_scores=mb_proposal_log_scores)
 
             # Dispatch eval samples
             for i, context in enumerate(contexts):
                 self.eval_samples_updated.dispatch(
                     context, mb_samples_nested[i], mb_proposal_log_scores[i],
-                    detached_model_scores[i], mb_target_log_scores[i]
+                    detached_policy_scores[i], mb_target_log_scores[i]
                 )
 
             # Batched gradient computation
             with Timer() as t_backprop:
                 self._compute_gradient_batched(
                     mb_samples_nested, mb_proposal_log_scores, mb_target_log_scores,
-                    mb_model_log_scores, contexts, n_steps
+                    mb_policy_log_scores, contexts, n_steps
                 )
             self.metric_updated.dispatch("timing/backpropagation_per_sample", t_backprop.elapsed / scoring_size)
 
@@ -391,9 +391,9 @@ class Tuner():
 
             if torch.any(valid_mask):
                 norm_target_scores = mb_target_log_scores[valid_mask] - torch.log(z_values_tensor.expand_as(mb_target_log_scores)[valid_mask])
-                model_scores_valid = detached_model_scores[valid_mask]
-                n_samples_to_boost += (norm_target_scores > model_scores_valid).sum().item()
-                n_samples_to_downweight += (norm_target_scores < model_scores_valid).sum().item()
+                policy_scores_valid = detached_policy_scores[valid_mask]
+                n_samples_to_boost += (norm_target_scores > policy_scores_valid).sum().item()
+                n_samples_to_downweight += (norm_target_scores < policy_scores_valid).sum().item()
 
         # Report final metrics after all mini-batches
         self._report_all_importance_sampling_estimates()
@@ -417,9 +417,9 @@ class Tuner():
 
     def tune(self):
         """
-        Fine-tunes model distribution's network
+        Fine-tunes policy distribution's model
 
-        Fine-tunes the network of the model distribution:
+        Fine-tunes the model of the policy distribution:
           - repeats n_gradient_steps tuning steps
           - eventually updates the samplee according to KL divergence
         """
@@ -449,12 +449,12 @@ class Tuner():
             Compute features moments on contexts extracted from the validation set
         """
         val_dataloader = torch.utils.data.DataLoader(self.val_dataset, batch_size=self.params["sampling_size"], shuffle=False, collate_fn=lambda x: x)
-        val_model = self.model.validation()
+        val_policy = self.policy.validation()
         features_moments = {label: WindowedMovingAverage(window_size=self.params["estimates_rolling_window_size"]) for label, _ in self.features}
 
         for val_contexts in tqdm(val_dataloader, desc="validation", leave=False):
             # We sample one per context
-            samples, _ = val_model.sample_batch(val_contexts, sampling_size=1)
+            samples, _ = val_policy.sample_batch(val_contexts, sampling_size=1)
 
             for (label, feature) in self.features:
                 for context, context_samples in zip(val_contexts, samples):

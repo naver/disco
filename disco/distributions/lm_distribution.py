@@ -42,7 +42,7 @@ class LMDistribution(BaseDistribution):
             auto class from Transformers, default is AutoModelForCausalLM
             but AutoModelForSeq2SeqLM is also valid
         freeze: boolean
-            flag to eventually (not) freeze the network's parameters
+            flag to eventually (not) freeze the model's parameters
         length: int
             number of tokens in the samples
         device: string
@@ -55,14 +55,14 @@ class LMDistribution(BaseDistribution):
             # assume also the tokenizer is a str
             self.tokenizer= AutoTokenizer.from_pretrained(tokenizer if tokenizer else model, padding_side="left")
             assert auto in [AutoModelForCausalLM, AutoModelForSeq2SeqLM], "only AutoModel, AutoModelForCausalLM and AutoModelForSeq2SeqLM are valid options."
-            self._load_network(auto, model, device)
+            self._load_model(auto, model, device)
         else:
             self.tokenizer = tokenizer
-            self.network = model
+            self.model = model
 
         self.device = device
-        self.network.to(self.device)
-        self.network.eval() # to make sure scoring is consistent
+        self.model.to(self.device)
+        self.model.eval() # to make sure scoring is consistent
         if freeze:
             self.freeze(True)
 
@@ -77,15 +77,15 @@ class LMDistribution(BaseDistribution):
         })
         self.gen_config.update(**config)
 
-    def _load_network(self, auto, model, device):
+    def _load_model(self, auto, model, device):
         print(f"Loading model to {device}")
         t0 = time.time()
-        self.network = auto.from_pretrained(model, device_map=device, trust_remote_code=True, use_safetensors=True)
+        self.model = auto.from_pretrained(model, device_map=device, trust_remote_code=True, use_safetensors=True)
         print(f"Model loaded in {time.time() - t0:.0f}s.", )
-        if not self.network.config.is_encoder_decoder and self.tokenizer.pad_token_id is None:
+        if not self.model.config.is_encoder_decoder and self.tokenizer.pad_token_id is None:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            self.network.resize_token_embeddings(len(self.tokenizer))
-            self.network.generation_config.pad_token_id = self.tokenizer.pad_token_id
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
 
     def validation(self):
         """"
@@ -97,7 +97,7 @@ class LMDistribution(BaseDistribution):
 
     def to(self, device):
         self.device = device
-        self.network.to(self.device)
+        self.model.to(self.device)
 
     def freeze(self, frozen=True):
         """Freeze (or unfreeze) parameters for gradient computation.
@@ -108,7 +108,7 @@ class LMDistribution(BaseDistribution):
             state to transition to, default is to freeze
         """
 
-        self.network.requires_grad_(not frozen)
+        self.model.requires_grad_(not frozen)
 
     def string_to_textsample(self, text):
         """
@@ -149,7 +149,7 @@ class LMDistribution(BaseDistribution):
         -------
         tuple of (list of TextSample(tokens, text), tensor of logprobs)
         """
-        if self.network.config.is_encoder_decoder:
+        if self.model.config.is_encoder_decoder:
             assert context, "Context (encoder input) is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
@@ -161,12 +161,12 @@ class LMDistribution(BaseDistribution):
             add_special_tokens=True
         )
         # Replicate the context for batch generation
-        tokenized_contexts = {k: v.to(self.network.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}
+        tokenized_contexts = {k: v.to(self.model.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}
 
         prompt_length = tokenized_contexts["input_ids"].shape[1]
 
         # Generate sequences and scores in one go
-        outputs = self.network.generate(
+        outputs = self.model.generate(
             **tokenized_contexts,
             output_scores=True,
             return_dict_in_generate=True,
@@ -267,7 +267,7 @@ class LMDistribution(BaseDistribution):
         }
 
         # Determine the length of the prompt to slice it off the output
-        if self.network.config.is_encoder_decoder:
+        if self.model.config.is_encoder_decoder:
             prompt_length = 1
             last = None
         else:
@@ -275,7 +275,7 @@ class LMDistribution(BaseDistribution):
             last = None
 
         # Generate sequences for the entire batch
-        outputs = self.network.generate(
+        outputs = self.model.generate(
             **batch,
             output_scores=True,
             return_dict_in_generate=True,
@@ -349,7 +349,7 @@ class LMDistribution(BaseDistribution):
         shapes = {s.token_ids.shape for s in samples}
         assert len(shapes) == 1, "All sequences of token_ids must have the same shape."
 
-        if self.network.config.is_encoder_decoder:
+        if self.model.config.is_encoder_decoder:
             assert context, "Context is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
@@ -367,7 +367,7 @@ class LMDistribution(BaseDistribution):
         )
 
         with torch.set_grad_enabled(grad):
-            outputs = self.network(**forward_kwargs)
+            outputs = self.model(**forward_kwargs)
 
         logits = outputs.logits
 
@@ -419,7 +419,7 @@ class LMDistribution(BaseDistribution):
 
         # 4. Vectorized handling of a forced BOS token, if applicable.
         # This prevents scoring the model on predicting the BOS token it was given.
-        forced_bos_token_id = getattr(self.network.config, "forced_bos_token_id", None)
+        forced_bos_token_id = getattr(self.model.config, "forced_bos_token_id", None)
         if forced_bos_token_id is not None:
             # Create a mask that is True only for the first token if it's a forced BOS
             is_forced_bos_at_start = (input_ids[:, 0] == forced_bos_token_id)
@@ -439,7 +439,7 @@ class LMDistribution(BaseDistribution):
             "_get_forward_inputs requires 'attention_mask' in tokenized_samples. " \
             "Please call _discount_padding_tokens first."
 
-        if self.network.config.is_encoder_decoder:
+        if self.model.config.is_encoder_decoder:
             encoder_inputs = tokenized_context
             decoder_inputs = tokenized_samples["input_ids"]
 
@@ -504,9 +504,9 @@ class LMDistribution(BaseDistribution):
         # 1. Get the full list of processors as before
         generation_config = copy.deepcopy(self.gen_config)
         # The _prepare_special_tokens call is often unnecessary here, but we keep for compatibility
-        self.network._prepare_special_tokens(generation_config, False, self.network.device)
+        self.model._prepare_special_tokens(generation_config, False, self.model.device)
 
-        full_processor_list = self.network._get_logits_processor(
+        full_processor_list = self.model._get_logits_processor(
             generation_config=generation_config,
             input_ids_seq_length=input_ids.shape[-1],
             encoder_input_ids=encoder_input_ids,
@@ -611,7 +611,7 @@ class LMDistribution(BaseDistribution):
         )
 
         with torch.set_grad_enabled(grad):
-            outputs = self.network(**forward_kwargs)
+            outputs = self.model(**forward_kwargs)
 
         logits = outputs.logits
 

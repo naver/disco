@@ -60,7 +60,7 @@ class AccumulationSampler(Sampler):
 
         return (samples, log_scores)
 
-    def sample_batch(self, contexts, sampling_size=32):
+    def sample_batch(self, contexts, sampling_size=32, output_scores=True):
         """
         Accumulates batches of samples for a list of contexts simultaneously.
 
@@ -88,8 +88,9 @@ class AccumulationSampler(Sampler):
 
         # Initialize containers for accumulating results for each context
         accumulated_samples = [[] for _ in range(num_contexts)]
-        # Store score tensors from each batch call in a list for each context
-        accumulated_scores_parts = [[] for _ in range(num_contexts)]
+        if output_scores:
+            # Store score tensors from each batch call in a list for each context
+            accumulated_scores_parts = [[] for _ in range(num_contexts)]
 
         with trange(
             self.total_size * num_contexts,
@@ -105,10 +106,15 @@ class AccumulationSampler(Sampler):
                 current_batch_size = min(remaining, sampling_size)
 
                 # Call the batched sampling method on the distribution
-                more_samples_nested, more_log_scores = self.distribution.sample_batch(
+                ret = self.distribution.sample_batch(
                     contexts=contexts,
-                    sampling_size=current_batch_size
+                    sampling_size=current_batch_size,
+                    output_scores=output_scores
                 )
+                if output_scores:
+                    more_samples_nested, more_log_scores = ret
+                else:
+                    more_samples_nested = ret
                 # `more_log_scores` has shape: (num_contexts, current_batch_size)
 
                 # Distribute the flat list of samples and batched scores to their
@@ -120,17 +126,22 @@ class AccumulationSampler(Sampler):
                     # Add samples for the i-th context
                     accumulated_samples[i].extend(more_samples_nested[i])
 
-                    # Append the score tensor for the i-th context
-                    accumulated_scores_parts[i].append(more_log_scores[i])
+                    if output_scores:
+                        # Append the score tensor for the i-th context
+                        accumulated_scores_parts[i].append(more_log_scores[i])
 
                 collected_count += current_batch_size
                 t.update(current_batch_size * num_contexts)
 
-        # Finalize the scores by concatenating the collected tensor parts for each context
-        # and then stacking them into a single (num_contexts, total_size) tensor.
-        final_scores = torch.stack(
-            [torch.cat(parts) for parts in accumulated_scores_parts],
-            dim=0
-        )
+        if output_scores:
+            # Finalize the scores by concatenating the collected tensor parts for each context
+            # and then stacking them into a single (num_contexts, total_size) tensor.
+            final_scores = torch.stack(
+                [torch.cat(parts) for parts in accumulated_scores_parts],
+                dim=0
+            )
 
-        return (accumulated_samples, final_scores)
+        if output_scores:
+            return (accumulated_samples, final_scores)
+        else:
+            return accumulated_samples

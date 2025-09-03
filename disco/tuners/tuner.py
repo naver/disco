@@ -308,17 +308,21 @@ class Tuner():
         """
         contexts = self._get_next_context_batch()
         num_contexts = len(contexts)
+        scoring_size = self.params["scoring_size"]
         sampler = AccumulationSampler(self.proposal, total_size=self.params["n_samples_per_context"])
 
         with Timer() as t_sampling:
-            samples_nested, proposal_log_scores = sampler.sample_batch(
+            samples_nested = sampler.sample_batch(
                 contexts=contexts,
-                sampling_size=self.params["sampling_size"]
+                sampling_size=self.params["sampling_size"],
+                output_scores=False
             )
             samples_flat = [s for sublist in samples_nested for s in sublist]
+        proposal_log_scores = score_in_chunks_batched(
+            self.proposal, samples_nested, contexts, scoring_size
+        )
         self.metric_updated.dispatch("timing/generation_per_sample", t_sampling.elapsed / len(samples_flat))
 
-        scoring_size = self.params["scoring_size"]
 
         with Timer() as t_scoring:
             target_log_scores = score_in_chunks_batched(
@@ -445,8 +449,8 @@ class Tuner():
             if torch.any(valid_mask):
                 norm_target_scores = mb_target_flat[valid_mask] - torch.log(z_values_tensor_flat[valid_mask])
                 policy_scores_valid = detached_policy_flat[valid_mask]
-            n_samples_to_boost += (norm_target_scores > policy_scores_valid).sum().item()
-            n_samples_to_downweight += (norm_target_scores < policy_scores_valid).sum().item()
+                n_samples_to_boost += (norm_target_scores > policy_scores_valid).sum().item()
+                n_samples_to_downweight += (norm_target_scores < policy_scores_valid).sum().item()
 
         # Report final metrics after all mini-batches
         self._report_all_importance_sampling_estimates()

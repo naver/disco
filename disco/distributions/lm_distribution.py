@@ -222,7 +222,7 @@ class LMDistribution(BaseDistribution):
 
         return (samples, seq_logprobs)
 
-    def sample_batch(self, contexts, sampling_size=32, sum=True):
+    def sample_batch(self, contexts, sampling_size=32, sum=True, output_scores=True):
         """
         Generates samples for a batch of contexts.
 
@@ -287,7 +287,7 @@ class LMDistribution(BaseDistribution):
         # Generate sequences for the entire batch
         outputs = self.model.generate(
             **batch,
-            output_scores=True,
+            output_scores=output_scores,
             return_dict_in_generate=True,
             max_new_tokens=self.length,
             do_sample=True,
@@ -297,48 +297,49 @@ class LMDistribution(BaseDistribution):
         # Process scores for the generated tokens
         generated_sequences = outputs.sequences[:, prompt_length:last]
 
-        logprobs_list = []
-        for i, scores_at_step in enumerate(outputs.scores):
-            generated_tokens_at_step = generated_sequences[:, i].unsqueeze(-1)
-            logprobs_at_step = scores_at_step.log_softmax(dim=-1)
-            token_logprob = torch.gather(logprobs_at_step, 1, generated_tokens_at_step)
-            logprobs_list.append(token_logprob)
-        token_seq_logprobs = torch.cat(logprobs_list, dim=1)
+        if output_scores:
+            logprobs_list = []
+            for i, scores_at_step in enumerate(outputs.scores):
+                generated_tokens_at_step = generated_sequences[:, i].unsqueeze(-1)
+                logprobs_at_step = scores_at_step.log_softmax(dim=-1)
+                token_logprob = torch.gather(logprobs_at_step, 1, generated_tokens_at_step)
+                logprobs_list.append(token_logprob)
+            token_seq_logprobs = torch.cat(logprobs_list, dim=1)
 
-        # Zero out log probabilities for padding tokens and any tokens
-        # generated after the first end-of-sequence (EOS) token.
-        first_eos_indices = get_token_first_indices(
-            generated_sequences, self.tokenizer.eos_token_id
-        )
-        non_pad_tokens = torch.cat(
-            (generated_sequences[:, 0].unsqueeze(1),
-             torch.where(
-                 self.tokenizer.pad_token_id == generated_sequences[:, 1:],
-                 torch.tensor(-1, device=self.device),
-                 generated_sequences[:, 1:])
-             ),
-            dim=1
-        )
-        non_pad_log_scores = torch.where(-1 != non_pad_tokens, token_seq_logprobs, torch.tensor(0., device=self.device))
+            # Zero out log probabilities for padding tokens and any tokens
+            # generated after the first end-of-sequence (EOS) token.
+            first_eos_indices = get_token_first_indices(
+                generated_sequences, self.tokenizer.eos_token_id
+            )
+            non_pad_tokens = torch.cat(
+                (generated_sequences[:, 0].unsqueeze(1),
+                torch.where(
+                    self.tokenizer.pad_token_id == generated_sequences[:, 1:],
+                    torch.tensor(-1, device=self.device),
+                    generated_sequences[:, 1:])
+                ),
+                dim=1
+            )
+            non_pad_log_scores = torch.where(-1 != non_pad_tokens, token_seq_logprobs, torch.tensor(0., device=self.device))
 
-        for i, ix in enumerate(first_eos_indices):
-            non_pad_log_scores[i][0] = token_seq_logprobs[i][0]
-            if ix != -1:
-                non_pad_log_scores[i][ix] = token_seq_logprobs[i][ix]
-                if ix + 1 < non_pad_log_scores.shape[1]:
-                    non_pad_log_scores[i][ix + 1:] = 0.
+            for i, ix in enumerate(first_eos_indices):
+                non_pad_log_scores[i][0] = token_seq_logprobs[i][0]
+                if ix != -1:
+                    non_pad_log_scores[i][ix] = token_seq_logprobs[i][ix]
+                    if ix + 1 < non_pad_log_scores.shape[1]:
+                        non_pad_log_scores[i][ix + 1:] = 0.
 
-        seq_logprobs_flat = non_pad_log_scores.sum(dim=1) if sum else non_pad_log_scores
+            seq_logprobs_flat = non_pad_log_scores.sum(dim=1) if sum else non_pad_log_scores
+
+            # Reshape the flat outputs back into a batched structure
+            # corresponding to the input contexts.
+            if sum:
+                seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size)
+            else:
+                seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size, -1)
 
         # Extract the generated token IDs (excluding the prompt)
         output_tokens_flat = outputs.sequences[:, prompt_length:]
-
-        # Reshape the flat outputs back into a batched structure
-        # corresponding to the input contexts.
-        if sum:
-            seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size)
-        else:
-            seq_logprobs = seq_logprobs_flat.view(num_contexts, sampling_size, -1)
 
         # Decode all tokens and create TextSample objects
         all_samples_decoded = self.tokenizer.batch_decode(output_tokens_flat, skip_special_tokens=True)
@@ -353,7 +354,10 @@ class LMDistribution(BaseDistribution):
             for i in range(num_contexts)
         ]
 
-        return all_samples_nested, seq_logprobs
+        if output_scores:
+            return all_samples_nested, seq_logprobs
+        else:
+            return all_samples_nested
 
     def log_score(self, samples, context="", grad=False, sum=True):
         """

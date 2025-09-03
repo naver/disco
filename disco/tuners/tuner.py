@@ -62,6 +62,7 @@ class Tuner():
         "estimates_rolling_window_size": 2**8, # number of samples to accumulate in a rollowing window estimate
         "validation_interval": 2**4, # number of steps every which to compute feature moments on the validation contexts
         "validate_on_start": True,
+        "max_z": None
     }
 
     def __init__(self, policy, target, proposal=None, context_dataset=None, val_dataset=None, loss=JSLoss(), features=[],
@@ -197,12 +198,102 @@ class Tuner():
             self.features_moments_proposal[label].update(proposal_moment_pointwise_estimates)
             self.features_moments_policy[label].update(importance_ratios * proposal_moment_pointwise_estimates)
 
-    def _update_moving_z(self, contexts, proposal_log_scores, target_log_scores):
+    def _update_moving_z(self, contexts, proposal_log_scores, target_log_scores, max_z=None):
+        """
+        Updates the moving average of the partition function z with batch-aware clipping.
+
+        This method calculates pointwise z estimates and clips them only if the
+        collective sum of new estimates for a given context would push its
+        moving average `z` above `max_z`. The `target_log_scores` tensor is
+        updated to reflect any clipping.
+
+        Args:
+            contexts (list): A list of contexts (e.g., prompts) for each sample.
+            proposal_log_scores (torch.Tensor): The log scores from the proposal distribution.
+                                                Shape: (num_contexts, num_samples_per_context)
+            target_log_scores (torch.Tensor): The log scores from the target distribution.
+                                              Shape: (num_contexts, num_samples_per_context)
+            max_z (float, optional): The maximum allowed value for the aggregate z.
+                                     If None, no clipping is performed. Defaults to None.
+
+        Returns:
+            torch.Tensor: The `target_log_scores` tensor, which will be updated in-place
+                          if any clipping occurred.
+        """
+        # Ensure all tensors are on the same device
         target_log_scores, proposal_log_scores = to_same_device(target_log_scores, proposal_log_scores)
-        z_pointwise_estimates_batch = torch.exp(target_log_scores - proposal_log_scores)
+
+        # 1. Calculate initial z estimates and create a modifiable copy
+        z_pointwise_estimates = torch.exp(target_log_scores - proposal_log_scores)
+        final_z_estimates = z_pointwise_estimates.clone()
+
+        if max_z is not None:
+            # 2. Iterate through each context, which corresponds to a row in the tensors
+            for i, context in enumerate(contexts):
+                moving_avg_instance = self.z.get(context)
+                if moving_avg_instance:
+                    current_avg = moving_avg_instance.value
+                    n = moving_avg_instance.weight
+                else:
+                    current_avg = 0.0
+                    n = 0
+
+                # Get all new estimates for the current context (an entire row)
+                new_estimates_for_context = z_pointwise_estimates[i]
+                k = new_estimates_for_context.shape[0] # num_samples_per_context
+                sum_new_estimates = new_estimates_for_context.sum().item()
+
+                # Calculate the potential new average using all new estimates for this context
+                potential_new_avg = (current_avg * n + sum_new_estimates) / (n + k)
+
+                # 3. If the potential average exceeds max_z, perform clipping
+                if potential_new_avg > max_z:
+                    # Calculate the required reduction in the sum of new estimates
+                    target_sum = max_z * (n + k) - current_avg * n
+                    total_reduction = sum_new_estimates - target_sum
+
+                    # Sort this context's estimates to clip the largest ones first
+                    sorted_estimates, sorted_indices = torch.sort(new_estimates_for_context, descending=True)
+
+                    # Create a temporary tensor for the clipped values of the current row
+                    clipped_row_estimates = new_estimates_for_context.clone()
+
+                    # Greedily apply the reduction to this context's largest estimates
+                    for j, original_col_index in enumerate(sorted_indices):
+                        if total_reduction <= 0:
+                            break
+
+                        estimate = sorted_estimates[j].item()
+                        reduction_for_this_item = min(total_reduction, estimate)
+                        clipped_row_estimates[original_col_index] -= reduction_for_this_item
+                        total_reduction -= reduction_for_this_item
+
+                    # Update the master tensor of final estimates with the clipped row
+                    final_z_estimates[i] = clipped_row_estimates
+
+        # 4. Update the original target_log_scores if any z values were clipped
+        clipped_mask = final_z_estimates != z_pointwise_estimates
+        if torch.any(clipped_mask):
+            final_z_clipped = final_z_estimates[clipped_mask]
+            proposal_scores_clipped = proposal_log_scores[clipped_mask]
+
+            # Reverse the calculation: target_score = proposal_score + log(z)
+            # This works correctly as boolean masking flattens the selected elements
+            new_target_scores = proposal_scores_clipped + torch.log(final_z_clipped)
+            target_log_scores[clipped_mask] = new_target_scores
+
+        # 5. Update moving averages and dispatch metrics using the final z-values
+        num_samples_per_context = final_z_estimates.shape[1]
         for i, context in enumerate(contexts):
-            self.z[context].update(z_pointwise_estimates_batch[i])
+            if context not in self.z:
+                self.z[context] = MovingAverage()
+            # Update the moving average with each new sample for the context
+            for j in range(num_samples_per_context):
+                self.z[context].update(final_z_estimates[i, j].item())
             self.metric_updated.dispatch('z', self.z[context].value)
+
+        # Return the modified tensor for inspection or further use
+        return target_log_scores
 
     def _update_divergence_estimates(self, estimates_dict, contexts, p_log_scores, q_log_scores, use_z=False, proposal_log_scores=None):
         p_log_scores, q_log_scores = to_same_device(p_log_scores, q_log_scores)
@@ -323,7 +414,6 @@ class Tuner():
         )
         self.metric_updated.dispatch("timing/generation_per_sample", t_sampling.elapsed / len(samples_flat))
 
-
         with Timer() as t_scoring:
             target_log_scores = score_in_chunks_batched(
                 self.target, samples_nested, contexts, scoring_size
@@ -337,7 +427,7 @@ class Tuner():
             )
 
         self.proposal.report_samples_stats(samples_flat, contexts, self.metric_updated)
-        self._update_moving_z(contexts, proposal_log_scores, target_log_scores)
+        target_log_score = self._update_moving_z(contexts, proposal_log_scores, target_log_scores, max_z=self.params["max_z"])
         self._update_divergence_estimates(self.divergence_estimates_target_proposal, contexts, target_log_scores, proposal_log_scores, use_z=True)
         if self.track_divergence_from_base:
              self._update_divergence_estimates(self.divergence_estimates_proposal_base, contexts, proposal_log_scores, base_log_scores, use_z=False, proposal_log_scores=proposal_log_scores)

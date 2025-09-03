@@ -339,61 +339,114 @@ class Tuner():
              self._update_divergence_estimates(self.divergence_estimates_proposal_base, contexts, proposal_log_scores, base_log_scores, use_z=False, proposal_log_scores=proposal_log_scores)
 
         n_samples_to_boost, n_samples_to_downweight = 0, 0
-        n_steps = len(contexts) * self.params["n_samples_per_context"] // self.params["scoring_size"]
 
-        mb_scoring_size = scoring_size // len(contexts)
+        all_indices = [
+            (i, j)
+            for i in range(len(contexts))
+            for j in range(self.params["n_samples_per_context"])
+        ]
+        total_samples = len(all_indices)
+
+        # Determine the number of steps based on the total sample count
+        n_steps = (total_samples + scoring_size - 1) // scoring_size
 
         for s in trange(n_steps, desc="mini-steps", leave=False):
             self.ministep_idx_updated.dispatch(s)
-            minibatch_slice = slice(s * mb_scoring_size, (s + 1) * mb_scoring_size)
 
-            mb_samples_nested = [sublist[minibatch_slice] for sublist in samples_nested]
+            # Create the minibatch from the flat index
+            start_idx = s * scoring_size
+            end_idx = min(start_idx + scoring_size, total_samples)
+            minibatch_indices = all_indices[start_idx:end_idx]
 
-            mb_proposal_log_scores = proposal_log_scores[:, minibatch_slice]
-            mb_target_log_scores = target_log_scores[:, minibatch_slice]
+            # Group sample indices by their original context
+            indices_by_context = defaultdict(list)
+            for ctx_idx, sample_idx in minibatch_indices:
+                indices_by_context[ctx_idx].append(sample_idx)
+
+            mb_context_indices = sorted(indices_by_context.keys())
+            mb_contexts = [contexts[i] for i in mb_context_indices]
+
+            # Each item in these lists corresponds to a context in `mb_contexts`.
+            mb_samples_nested = []
+            mb_proposal_log_scores_ragged = []
+            mb_target_log_scores_ragged = []
             if self.track_divergence_from_base:
-                mb_base_log_scores = base_log_scores[:, minibatch_slice]
+                mb_base_log_scores_ragged = []
 
-            mb_policy_log_scores = self.policy.log_score_batch(
+            for i in mb_context_indices:
+                sample_indices_for_ctx = indices_by_context[i]
+
+                # Gather samples
+                mb_samples_nested.append([samples_nested[i][j] for j in sample_indices_for_ctx])
+
+                # Gather scores using advanced tensor indexing
+                idx_tensor = torch.LongTensor(sample_indices_for_ctx).to(proposal_log_scores.device)
+                mb_proposal_log_scores_ragged.append(proposal_log_scores[i, idx_tensor])
+                mb_target_log_scores_ragged.append(target_log_scores[i, idx_tensor])
+                if self.track_divergence_from_base:
+                    mb_base_log_scores_ragged.append(base_log_scores[i, idx_tensor])
+
+            mb_policy_log_scores_ragged = self.policy.log_score_batch(
                 samples=mb_samples_nested,
-                contexts=contexts,
+                contexts=mb_contexts,
                 grad=True
             )
+            detached_policy_scores_ragged = [t.detach() for t in mb_policy_log_scores_ragged]
 
-            # Detach policy scores for metric calculations to not affect gradients
-            detached_policy_scores = mb_policy_log_scores.detach()
+            # These calls now process one context from the minibatch at a time.
+            for i, context in enumerate(mb_contexts):
+                self._update_divergence_estimates(
+                    self.divergence_estimates_target_policy, [context],
+                    mb_target_log_scores_ragged[i].unsqueeze(0),
+                    detached_policy_scores_ragged[i].unsqueeze(0),
+                    use_z=True,
+                    proposal_log_scores=mb_proposal_log_scores_ragged[i].unsqueeze(0)
+                )
+                if self.track_divergence_from_base:
+                    self._update_divergence_estimates(
+                        self.divergence_estimates_policy_base, [context],
+                        detached_policy_scores_ragged[i].unsqueeze(0),
+                        mb_base_log_scores_ragged[i].unsqueeze(0),
+                        use_z=False,
+                        proposal_log_scores=mb_proposal_log_scores_ragged[i].unsqueeze(0)
+                    )
 
-            # Batched updates for policy-dependent metrics
-            self._update_divergence_estimates(self.divergence_estimates_target_policy, contexts, mb_target_log_scores, detached_policy_scores, use_z=True, proposal_log_scores=mb_proposal_log_scores)
-            if self.track_divergence_from_base:
-                self._update_divergence_estimates(self.divergence_estimates_policy_base, contexts, detached_policy_scores, mb_base_log_scores, use_z=False, proposal_log_scores=mb_proposal_log_scores)
-
-            # Dispatch eval samples
-            for i, context in enumerate(contexts):
+            for i, context in enumerate(mb_contexts):
                 self.eval_samples_updated.dispatch(
-                    context, mb_samples_nested[i], mb_proposal_log_scores[i],
-                    detached_policy_scores[i], mb_target_log_scores[i]
+                    context, mb_samples_nested[i], mb_proposal_log_scores_ragged[i],
+                    detached_policy_scores_ragged[i], mb_target_log_scores_ragged[i]
                 )
 
-            # Batched gradient computation
             with Timer() as t_backprop:
+                # NOTE: Assumes `_compute_gradient_batched` is adapted to handle ragged lists of tensors.
                 self._compute_gradient_batched(
-                    mb_samples_nested, mb_proposal_log_scores, mb_target_log_scores,
-                    mb_policy_log_scores, contexts, n_steps
+                    mb_samples_nested, mb_proposal_log_scores_ragged, mb_target_log_scores_ragged,
+                    mb_policy_log_scores_ragged, mb_contexts, n_steps
                 )
-            self.metric_updated.dispatch("timing/backpropagation_per_sample", t_backprop.elapsed / scoring_size)
+            # Use the actual number of samples in the minibatch for accurate timing
+            self.metric_updated.dispatch("timing/backpropagation_per_sample", t_backprop.elapsed / len(minibatch_indices))
 
-            # Batched boost/downweight stats calculation
-            z_values_tensor = torch.tensor([self.z[c].value for c in contexts], device=mb_target_log_scores.device).unsqueeze(1)
-            in_support = ~mb_target_log_scores.isneginf()
-            valid_z = z_values_tensor > 0
+            # Flatten the ragged lists to perform vectorized calculations across the entire minibatch.
+            mb_target_flat = torch.cat(mb_target_log_scores_ragged)
+            detached_policy_flat = torch.cat(detached_policy_scores_ragged)
+
+            # Create a corresponding flat tensor of z-values for each sample.
+            z_values_list = []
+            for i, ctx_idx in enumerate(mb_context_indices):
+                n_samples_for_ctx = len(mb_samples_nested[i])
+                z_val = self.z[contexts[ctx_idx]].value
+                z_values_list.extend([z_val] * n_samples_for_ctx)
+            z_values_tensor_flat = torch.tensor(z_values_list, device=mb_target_flat.device)
+
+            in_support = ~mb_target_flat.isneginf()
+            valid_z = z_values_tensor_flat > 0
             valid_mask = in_support & valid_z
 
             if torch.any(valid_mask):
-                norm_target_scores = mb_target_log_scores[valid_mask] - torch.log(z_values_tensor.expand_as(mb_target_log_scores)[valid_mask])
-                policy_scores_valid = detached_policy_scores[valid_mask]
-                n_samples_to_boost += (norm_target_scores > policy_scores_valid).sum().item()
-                n_samples_to_downweight += (norm_target_scores < policy_scores_valid).sum().item()
+                norm_target_scores = mb_target_flat[valid_mask] - torch.log(z_values_tensor_flat[valid_mask])
+                policy_scores_valid = detached_policy_flat[valid_mask]
+            n_samples_to_boost += (norm_target_scores > policy_scores_valid).sum().item()
+            n_samples_to_downweight += (norm_target_scores < policy_scores_valid).sum().item()
 
         # Report final metrics after all mini-batches
         self._report_all_importance_sampling_estimates()

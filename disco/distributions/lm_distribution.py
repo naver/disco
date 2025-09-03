@@ -601,6 +601,7 @@ class LMDistribution(BaseDistribution):
         """
         assert len(contexts) > 0
         assert len(samples) == len(contexts)
+        assert len(samples[0]) > 0, "Each context must have at least one corresponding sample."
 
         if self.process_context_fn:
             contexts = [(self.process_context_fn)(context) for context in contexts]

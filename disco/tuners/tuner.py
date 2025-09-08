@@ -545,8 +545,8 @@ class Tuner():
         # Report final metrics after all mini-batches
         self._report_all_importance_sampling_estimates()
 
-        self.metric_updated.dispatch("n_samples_to_boost", n_samples_to_boost)
-        self.metric_updated.dispatch("n_samples_to_downweight", n_samples_to_downweight)
+        self.metric_updated.dispatch("n_correct_samples", n_samples_to_boost + n_samples_to_downweight)
+        self.metric_updated.dispatch("n_correct_samples_boost_delta", n_samples_to_boost - n_samples_to_downweight)
 
         self.optimizer.step()
         self.scheduler.step()

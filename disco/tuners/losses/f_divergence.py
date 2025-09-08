@@ -23,7 +23,7 @@ class FDivergenceLoss(BaseLoss):
         else:
             self.baseline = None
 
-    def __call__(self, samples, context, proposal_log_scores, target_log_scores, policy_log_scores, z):
+    def __call__(self, proposal_log_scores, target_log_scores, policy_log_scores, z):
         """
         Computes the KL loss on a given minibatch of samples
         ∇ loss = π(x) / q(x) * f'(π(x) / p(x))) * ∇ log π(x)

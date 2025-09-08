@@ -372,8 +372,7 @@ class Tuner():
             if z_value > 0:
                 z = torch.tensor(z_value, device=policy_log_scores.device, dtype=policy_log_scores.dtype)
                 loss = self._loss(
-                    samples_nested[i], context, proposal_log_scores[i],
-                    target_log_scores[i], policy_log_scores[i], z
+                    proposal_log_scores[i], target_log_scores[i], policy_log_scores[i], z
                 )
                 losses.append(loss)
 

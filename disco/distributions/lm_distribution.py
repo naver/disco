@@ -86,10 +86,6 @@ class LMDistribution(BaseDistribution):
         self.model = auto.from_pretrained(model, device_map=device, trust_remote_code=True, use_safetensors=True)
         self.device = self.model.device
         print(f"Model loaded in {time.time() - t0:.0f}s.", )
-        if not self.model.config.is_encoder_decoder and self.tokenizer.pad_token_id is None:
-            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            self.model.resize_token_embeddings(len(self.tokenizer))
-            self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
 
     def validation(self):
         """"

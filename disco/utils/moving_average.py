@@ -104,3 +104,7 @@ class MovingAverage:
             total_weight = self.weight + new_weight
             self.value = (self.value * self.weight + new_mean * new_weight) / total_weight
             self.weight = total_weight
+
+    def reset(self):
+        self.weight = 0
+        self.value = None

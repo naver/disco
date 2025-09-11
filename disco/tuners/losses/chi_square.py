@@ -25,4 +25,4 @@ class ChiSquaredLoss(FDivergenceLoss):
         log_t: 0-dim Tensor
             The log ratio of the policy and the normalized target distribution
         """
-        return torch.exp(log_t) - 1
+        return 1.0 - torch.exp(-2 * log_t)

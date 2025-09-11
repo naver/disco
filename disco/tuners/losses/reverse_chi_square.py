@@ -22,12 +22,9 @@ class ReverseChiSquaredLoss(FDivergenceLoss):
         """
         Computes the f' term for the reverse (Neyman) chi-square divergence.
 
-        It corresponds to the generator f(u) = (u-1)^2 / u,
-        whose derivative is f'(u) = 1 - 1/u^2.
-
         Parameters
         ----------
         log_t: 0-dim Tensor
             The log ratio of the policy and the normalized target distribution, log(p/q).
         """
-        return 1.0 - torch.exp(-2 * log_t)
+        return (torch.exp(log_t) - 1) * 2

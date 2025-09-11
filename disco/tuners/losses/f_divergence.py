@@ -23,7 +23,7 @@ class FDivergenceLoss(BaseLoss):
         else:
             self.baseline = None
 
-    def __call__(self, proposal_log_scores, target_log_scores, policy_log_scores, z):
+    def __call__(self, proposal_log_probs, target_log_scores, policy_log_probs, z):
         """
         Computes the KL loss on a given minibatch of samples
         ∇ loss = π(x) / q(x) * f'(π(x) / p(x))) * ∇ log π(x)
@@ -47,9 +47,9 @@ class FDivergenceLoss(BaseLoss):
         -------
         mean loss across the minibatch
         """
-        norm_target_log_scores = target_log_scores - torch.log(z)
+        target_log_probs = target_log_scores - torch.log(z)
 
-        log_t = policy_log_scores.detach() - norm_target_log_scores
+        log_t = policy_log_probs.detach() - target_log_probs
 
         # implemented in derived class depending on the desired f
         f_prime = self.f_prime(log_t)
@@ -75,11 +75,11 @@ class FDivergenceLoss(BaseLoss):
         for a in advantage:
             self.metric_updated.dispatch('advantage', a.item())
 
-        importance_ratios = (policy_log_scores.detach() - proposal_log_scores).exp()
+        importance_ratios = (policy_log_probs.detach() - proposal_log_probs).exp()
 
         for ir in importance_ratios:
             self.metric_updated.dispatch('importance_ratios', ir.item())
 
-        loss = (importance_ratios * (-advantage) * policy_log_scores).mean()
+        loss = (importance_ratios * (-advantage) * policy_log_probs).mean()
 
         return loss

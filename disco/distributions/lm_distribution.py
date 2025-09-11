@@ -28,7 +28,7 @@ class LMDistribution(BaseDistribution):
 
     def __init__(self,
             model="gpt2", tokenizer=None, auto=AutoModelForCausalLM, freeze=True,
-            length=40, device="cpu", process_context_fn=None,
+            length=1024, device="auto", process_context_fn=None,
             **config
         ):
         """
@@ -357,7 +357,7 @@ class LMDistribution(BaseDistribution):
 
     def log_score(self, samples, context="", grad=False, sum=True):
         """
-        Computes log-probabilities for samples
+        Computes log-probabilities for samples.
         """
         shapes = {s.token_ids.shape for s in samples}
         assert len(shapes) == 1, "All sequences of token_ids must have the same shape."
@@ -372,13 +372,9 @@ class LMDistribution(BaseDistribution):
 
         tokenized_context = self.tokenizer([context] * len(samples), return_tensors="pt", add_special_tokens=True, padding=True)
         tokenized_context = {k: v.to(self.device) for k, v in tokenized_context.items()}
-
         tokenized_samples = {"input_ids": torch.stack([s.token_ids for s in samples]).to(self.device)}
-
-        # This adds the 'attention_mask' key to tokenized_samples.
         tokenized_samples = self._discount_padding_tokens(tokenized_samples)
-
-        _, _, forward_kwargs, labels, prompt_length, _ = self._get_forward_inputs(
+        _, _, forward_kwargs, labels, _, _ = self._get_forward_inputs(
             tokenized_context, tokenized_samples, samples
         )
 
@@ -386,30 +382,15 @@ class LMDistribution(BaseDistribution):
             outputs = self.model(**forward_kwargs)
 
         logits = outputs.logits
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
 
-        # The labels tensor is already correctly formatted with -100 for ignored tokens.
+        padding_mask = (shift_labels == -100)
+        clean_shift_labels = shift_labels.clone()
+        clean_shift_labels[padding_mask] = 0
 
-        # Shift logits and labels for proper alignment
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-
-        # Reshape for cross_entropy
-        batch_size, seq_len, vocab_size = shift_logits.shape
-        # cast for consistency with sample scoring
-        logits_for_loss = shift_logits.view(batch_size * seq_len, vocab_size).float()
-        labels_for_loss = shift_labels.view(batch_size * seq_len)
-
-        # Calculate negative log-probabilities
-        # F.cross_entropy will handle the ignore_index=-100 from the labels tensor.
-        token_neg_logprobs = F.cross_entropy(
-            logits_for_loss,
-            labels_for_loss,
-            reduction='none',
-            ignore_index=-100
-        )
-
-        # Reshape back and negate to get log-probabilities
-        seq_logprobs = -token_neg_logprobs.view(batch_size, seq_len)
+        seq_logprobs = selective_log_softmax(shift_logits, clean_shift_labels)
+        seq_logprobs.masked_fill_(padding_mask, 0.0)
 
         return seq_logprobs.sum(dim=1) if sum else seq_logprobs
 
@@ -576,28 +557,6 @@ class LMDistribution(BaseDistribution):
         """
         Computes log-probabilities for a batch of samples, each associated with a
         corresponding context from a list.
-
-        Parameters
-        ----------
-        samples : list of lists of TextSample
-            A nested list of sample objects. Each list of sample objects
-            is paired with the corresponding context.
-        contexts : list of str
-            A list of contextual text strings. The length of this list is the
-            primary batch dimension.
-        grad : bool, optional
-            Whether to enable gradient computation, by default False.
-        sum : bool, optional
-            If True, returns the sum of log-probabilities for each sequence.
-            If False, returns a tensor of token-level log-probabilities.
-            By default True.
-
-        Returns
-        -------
-        torch.Tensor
-            A tensor containing the log-probabilities.
-            - If `sum` is True, shape is `(num_contexts, n_repeats)`.
-            - If `sum` is False, shape is `(num_contexts, n_repeats, sequence_length)`.
         """
         assert len(contexts) > 0
         assert len(samples) == len(contexts)
@@ -609,23 +568,16 @@ class LMDistribution(BaseDistribution):
         num_contexts = len(contexts)
         n_samples_per_context = len(samples[0])
 
-        # Tokenize all unique contexts at once with padding
         tokenized_contexts_unique = self.tokenizer(
-            contexts, return_tensors="pt", add_special_tokens=True, padding=True
+            contexts, return_tensors="pt", add_special_tokens=True, padding=True, padding_side="left"
         )
-
         samples_flat = [s for sublist in samples for s in sublist]
-
-        # Repeat each context to align with the flat samples list
         tokenized_context = {
             k: v.repeat_interleave(n_samples_per_context, dim=0).to(self.device)
             for k, v in tokenized_contexts_unique.items()
         }
-
         tokenized_samples = {"input_ids": torch.stack([s.token_ids for s in samples_flat]).to(self.device)}
-
         tokenized_samples = self._discount_padding_tokens(tokenized_samples)
-
         _, _, forward_kwargs, labels, _, _ = self._get_forward_inputs(
             tokenized_context, tokenized_samples, samples_flat
         )
@@ -634,29 +586,21 @@ class LMDistribution(BaseDistribution):
             outputs = self.model(**forward_kwargs)
 
         logits = outputs.logits
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
 
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        padding_mask = (shift_labels == -100)
+        clean_shift_labels = shift_labels.clone()
+        clean_shift_labels[padding_mask] = 0
 
-        batch_size, seq_len, vocab_size = shift_logits.shape
-        logits_for_loss = shift_logits.view(batch_size * seq_len, vocab_size).float()
-        labels_for_loss = shift_labels.view(batch_size * seq_len)
-
-        token_neg_logprobs = F.cross_entropy(
-            logits_for_loss,
-            labels_for_loss,
-            reduction='none',
-            ignore_index=-100
-        )
-
-        seq_logprobs_flat = -token_neg_logprobs.view(batch_size, seq_len)
+        seq_logprobs_flat = selective_log_softmax(shift_logits, clean_shift_labels)
+        seq_logprobs_flat.masked_fill_(padding_mask, 0.0)
 
         if sum:
             summed_logprobs = seq_logprobs_flat.sum(dim=1)
             return summed_logprobs.view(num_contexts, n_samples_per_context)
         else:
             return seq_logprobs_flat.view(num_contexts, n_samples_per_context, -1)
-
 
     def report_samples_stats(self, samples, contexts, observable):
         """
@@ -676,3 +620,30 @@ class LMDistribution(BaseDistribution):
             length_without_padding = sum(1 for token_id in sample.token_ids if token_id != pad_token_id)
             observable.dispatch("sample_length_with_padding", length_with_padding)
             observable.dispatch("sample_length_without_padding", length_without_padding)
+
+# From https://www.tylerromero.com/posts/2025-02-selective-log-softmax/
+def selective_log_softmax(logits, index):
+    """Compute log softmax probabilities for selected tokens.
+
+    Args:
+        logits (`torch.Tensor`):
+            Logits tensor of shape `(..., num_classes)`.
+        index (`torch.Tensor`):
+            Index tensor of shape `(...)`, specifying the positions to gather from the log-softmax output.
+    Returns:
+        `torch.Tensor`:
+            Gathered log probabilities with the same shape as `index`.
+    """
+    if logits.dtype in [torch.float32, torch.float64]:
+        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])  # loop to reduce peak mem consumption
+        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        token_logprobs = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+    else:
+        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
+        token_logprobs = []
+        for logits_row, index_row in zip(logits, index):  # loop to reduce peak mem consumption
+            logprobs_row = logits_row.log_softmax(dim=-1)
+            token_logprobs_row = torch.gather(logprobs_row, dim=-1, index=index_row.unsqueeze(-1)).squeeze(-1)
+            token_logprobs.append(token_logprobs_row)
+        token_logprobs = torch.stack(token_logprobs)
+    return token_logprobs

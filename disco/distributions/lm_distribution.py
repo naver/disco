@@ -63,6 +63,9 @@ class LMDistribution(BaseDistribution):
             self.model = model
             self.device = model.device
 
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
         self.model.eval() # to make sure scoring is consistent
         if freeze:
             self.freeze(True)
@@ -159,9 +162,8 @@ class LMDistribution(BaseDistribution):
 
         tokenized_context = self.tokenizer(
             context,
-            padding=True,
             return_tensors="pt",
-            add_special_tokens=True
+            add_special_tokens=False
         )
         # Replicate the context for batch generation
         tokenized_contexts = {k: v.to(self.model.device).repeat(sampling_size, 1) for k, v in tokenized_context.items()}
@@ -257,8 +259,9 @@ class LMDistribution(BaseDistribution):
         tokenized_contexts = self.tokenizer(
             contexts,
             padding=True,
+            padding_side="left",
             return_tensors="pt",
-            add_special_tokens=True
+            add_special_tokens=False
         ).to(self.device)
 
         num_contexts = len(contexts)
@@ -370,7 +373,7 @@ class LMDistribution(BaseDistribution):
         if self.process_context_fn:
             context = (self.process_context_fn)(context)
 
-        tokenized_context = self.tokenizer([context] * len(samples), return_tensors="pt", add_special_tokens=True, padding=True)
+        tokenized_context = self.tokenizer([context] * len(samples), return_tensors="pt", add_special_tokens=False)
         tokenized_context = {k: v.to(self.device) for k, v in tokenized_context.items()}
         tokenized_samples = {"input_ids": torch.stack([s.token_ids for s in samples]).to(self.device)}
         tokenized_samples = self._discount_padding_tokens(tokenized_samples)
@@ -569,7 +572,7 @@ class LMDistribution(BaseDistribution):
         n_samples_per_context = len(samples[0])
 
         tokenized_contexts_unique = self.tokenizer(
-            contexts, return_tensors="pt", add_special_tokens=True, padding=True, padding_side="left"
+            contexts, return_tensors="pt", add_special_tokens=False, padding=True, padding_side="left"
         )
         samples_flat = [s for sublist in samples for s in sublist]
         tokenized_context = {

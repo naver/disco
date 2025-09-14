@@ -152,7 +152,8 @@ class LMDistribution(BaseDistribution):
         -------
         tuple of (list of TextSample(tokens, text), tensor of logprobs)
         """
-        if self.model.config.is_encoder_decoder:
+        unwrapped_model = getattr(self.model, 'module', self.model)
+        if unwrapped_model.config.is_encoder_decoder:
             assert context, "Context (encoder input) is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
@@ -276,7 +277,8 @@ class LMDistribution(BaseDistribution):
         }
 
         # Determine the length of the prompt to slice it off the output
-        if self.model.config.is_encoder_decoder:
+        unwrapped_model = getattr(self.model, 'module', self.model)
+        if unwrapped_model.config.is_encoder_decoder:
             prompt_length = 1
             last = None
         else:
@@ -365,7 +367,8 @@ class LMDistribution(BaseDistribution):
         shapes = {s.token_ids.shape for s in samples}
         assert len(shapes) == 1, "All sequences of token_ids must have the same shape."
 
-        if self.model.config.is_encoder_decoder:
+        unwrapped_model = getattr(self.model, 'module', self.model)
+        if unwrapped_model.config.is_encoder_decoder:
             assert context, "Context is mandatory for encoder-decoder models."
         elif not context:
             context = self.tokenizer.bos_token
@@ -419,7 +422,8 @@ class LMDistribution(BaseDistribution):
 
         # 4. Vectorized handling of a forced BOS token, if applicable.
         # This prevents scoring the model on predicting the BOS token it was given.
-        forced_bos_token_id = getattr(self.model.config, "forced_bos_token_id", None)
+        unwrapped_model = getattr(self.model, 'module', self.model)
+        forced_bos_token_id = getattr(unwrapped_model.config, "forced_bos_token_id", None)
         if forced_bos_token_id is not None:
             # Create a mask that is True only for the first token if it's a forced BOS
             is_forced_bos_at_start = (input_ids[:, 0] == forced_bos_token_id)
@@ -439,7 +443,8 @@ class LMDistribution(BaseDistribution):
             "_get_forward_inputs requires 'attention_mask' in tokenized_samples. " \
             "Please call _discount_padding_tokens first."
 
-        if self.model.config.is_encoder_decoder:
+        unwrapped_model = getattr(self.model, 'module', self.model)
+        if unwrapped_model.config.is_encoder_decoder:
             encoder_inputs = tokenized_context
             decoder_inputs = tokenized_samples["input_ids"]
 
